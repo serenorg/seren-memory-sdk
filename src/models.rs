@@ -39,3 +39,36 @@ pub struct CloudMemory {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+/// Input for session bootstrap.
+#[derive(Debug, Clone, Serialize)]
+pub struct BootstrapInput {
+    pub project_id: Option<Uuid>,
+    pub org_id: Option<Uuid>,
+    pub token_budget: Option<usize>,
+}
+
+/// Cloud session context returned by the MCP session_bootstrap tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CloudSessionContext {
+    pub memories_by_type: std::collections::HashMap<String, Vec<String>>,
+    pub total_memories: usize,
+}
+
+/// Assembled session context for LLM system prompt injection.
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    pub memories_by_type: std::collections::HashMap<String, Vec<String>>,
+    pub total_memories: usize,
+    pub assembled_prompt: String,
+    pub source: ContextSource,
+}
+
+/// Where the bootstrap context came from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContextSource {
+    /// Fresh data from the cloud.
+    Cloud,
+    /// Stale data from local cache (offline mode).
+    LocalCache,
+}

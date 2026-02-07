@@ -6,7 +6,7 @@ use reqwest::Client;
 use uuid::Uuid;
 
 use crate::error::{SdkError, SdkResult};
-use crate::models::CloudMemory;
+use crate::models::{BootstrapInput, CloudMemory, CloudSessionContext};
 
 pub struct MemoryClient {
     base_url: String,
@@ -84,6 +84,55 @@ impl MemoryClient {
 
         let body: PullMemoriesResponse = resp.json().await?;
         Ok(body.memories)
+    }
+
+    /// Call the cloud session_bootstrap MCP tool via JSON-RPC.
+    pub async fn session_bootstrap(
+        &self,
+        input: &BootstrapInput,
+    ) -> SdkResult<CloudSessionContext> {
+        let url = format!("{}/mcp", self.base_url);
+
+        let rpc_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "session_bootstrap",
+                "arguments": input,
+            }
+        });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&rpc_request)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(SdkError::Unauthorized);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SdkError::ServerError { status, body });
+        }
+
+        let rpc_response: serde_json::Value = resp.json().await?;
+
+        // Extract the text content from the MCP tools/call response.
+        // Format: { "result": { "content": [{ "type": "text", "text": "..." }] } }
+        let text = rpc_response["result"]["content"][0]["text"]
+            .as_str()
+            .ok_or_else(|| {
+                SdkError::Other("unexpected MCP response format".to_string())
+            })?;
+
+        let context: CloudSessionContext = serde_json::from_str(text)?;
+        Ok(context)
     }
 }
 

@@ -200,6 +200,32 @@ impl LocalCache {
             .query_row("SELECT COUNT(*) FROM cached_memories", [], |row| row.get(0))?;
         Ok(count as usize)
     }
+
+    /// List recent memories ordered by creation time (newest first).
+    pub fn list_recent(&self, limit: usize) -> SdkResult<Vec<CachedMemory>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, content, memory_type, metadata, embedding,
+                    relevance_score, created_at, synced, cloud_id
+             FROM cached_memories
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok(parse_memory_row(row))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(Ok(memory)) => results.push(memory),
+                Ok(Err(e)) => tracing::warn!("failed to parse memory: {e}"),
+                Err(e) => tracing::warn!("failed to read row: {e}"),
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 fn f32_slice_to_bytes(slice: &[f32]) -> Vec<u8> {
