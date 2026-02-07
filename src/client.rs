@@ -23,6 +23,14 @@ impl MemoryClient {
         }
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
     /// Push a single memory to the cloud. Returns the cloud-assigned UUID.
     pub async fn push_memory(&self, memory: &PushMemoryRequest) -> SdkResult<Uuid> {
         let url = format!("{}/api/memories", self.base_url);

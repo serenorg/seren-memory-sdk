@@ -3,6 +3,11 @@ name = "seren-memory-sdk"
 version = "0.1.0"
 edition = "2021"
 description = "Rust SDK for seren-memory: local cache, sync, and session bootstrap"
+license = "MIT"
+repository = "https://github.com/serenorg/seren-memory-sdk"
+homepage = "https://serendb.com"
+keywords = ["memory", "ai", "agent", "sqlite", "vector"]
+categories = ["database", "caching"]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

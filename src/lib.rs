@@ -9,3 +9,6 @@ pub mod models;
 pub mod sync;
 
 pub use error::{SdkError, SdkResult};
+
+// Re-export chrono for consumers that need to construct CachedMemory.
+pub use chrono;
