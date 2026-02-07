@@ -6,7 +6,7 @@ use reqwest::Client;
 use uuid::Uuid;
 
 use crate::error::{SdkError, SdkResult};
-use crate::models::{BootstrapInput, CloudMemory, CloudSessionContext};
+use crate::models::{BootstrapInput, CloudMemory, CloudSessionContext, RecallResult};
 
 pub struct MemoryClient {
     base_url: String,
@@ -133,6 +133,93 @@ impl MemoryClient {
 
         let context: CloudSessionContext = serde_json::from_str(text)?;
         Ok(context)
+    }
+
+    /// Store a memory via the cloud MCP remember tool.
+    pub async fn remember(
+        &self,
+        content: &str,
+        memory_type: &str,
+        project_id: Option<Uuid>,
+        org_id: Option<Uuid>,
+    ) -> SdkResult<String> {
+        let mut args = serde_json::json!({
+            "content": content,
+            "memory_type": memory_type,
+        });
+        if let Some(pid) = project_id {
+            args["project_id"] = serde_json::json!(pid);
+        }
+        if let Some(oid) = org_id {
+            args["org_id"] = serde_json::json!(oid);
+        }
+
+        let text = self.call_mcp_tool("remember", args).await?;
+        Ok(text)
+    }
+
+    /// Search memories via the cloud MCP recall tool.
+    pub async fn recall(
+        &self,
+        query: &str,
+        project_id: Option<Uuid>,
+        limit: Option<usize>,
+    ) -> SdkResult<Vec<RecallResult>> {
+        let mut args = serde_json::json!({ "query": query });
+        if let Some(pid) = project_id {
+            args["project_id"] = serde_json::json!(pid);
+        }
+        if let Some(lim) = limit {
+            args["limit"] = serde_json::json!(lim);
+        }
+
+        let text = self.call_mcp_tool("recall", args).await?;
+        let results: Vec<RecallResult> = serde_json::from_str(&text)?;
+        Ok(results)
+    }
+
+    /// Send a JSON-RPC tools/call request to the MCP endpoint.
+    async fn call_mcp_tool(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> SdkResult<String> {
+        let url = format!("{}/mcp", self.base_url);
+
+        let rpc_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+            }
+        });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&rpc_request)
+            .send()
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(SdkError::Unauthorized);
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(SdkError::ServerError { status, body });
+        }
+
+        let rpc_response: serde_json::Value = resp.json().await?;
+
+        rpc_response["result"]["content"][0]["text"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| SdkError::Other("unexpected MCP response format".to_string()))
     }
 }
 
@@ -285,6 +372,99 @@ mod tests {
             .pull_memories(Uuid::new_v4(), None, None)
             .await
             .unwrap_err();
+        assert!(matches!(err, SdkError::Unauthorized));
+    }
+
+    fn mcp_tool_response(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{ "type": "text", "text": text }]
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn remember_calls_mcp_tool() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mcp_tool_response("Memory stored successfully")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::new(server.uri(), "test-key".to_string());
+        let result = client
+            .remember("test fact", "semantic", None, None)
+            .await
+            .unwrap();
+        assert_eq!(result, "Memory stored successfully");
+    }
+
+    #[tokio::test]
+    async fn remember_returns_unauthorized() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::new(server.uri(), "bad-key".to_string());
+        let err = client
+            .remember("test", "semantic", None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SdkError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn recall_returns_results() {
+        let server = MockServer::start().await;
+
+        let results = serde_json::json!([
+            { "content": "Axum 0.8 is used", "memory_type": "semantic", "relevance_score": 0.95 },
+            { "content": "Use snake_case", "memory_type": "convention", "relevance_score": 0.8 }
+        ]);
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mcp_tool_response(&results.to_string())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::new(server.uri(), "test-key".to_string());
+        let results = client.recall("what framework", None, Some(5)).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].content, "Axum 0.8 is used");
+        assert_eq!(results[1].memory_type, "convention");
+    }
+
+    #[tokio::test]
+    async fn recall_returns_unauthorized() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::new(server.uri(), "bad-key".to_string());
+        let err = client.recall("query", None, None).await.unwrap_err();
         assert!(matches!(err, SdkError::Unauthorized));
     }
 }

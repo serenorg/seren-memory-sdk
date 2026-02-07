@@ -72,3 +72,11 @@ pub enum ContextSource {
     /// Stale data from local cache (offline mode).
     LocalCache,
 }
+
+/// A single result from the cloud recall tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecallResult {
+    pub content: String,
+    pub memory_type: String,
+    pub relevance_score: f64,
+}
