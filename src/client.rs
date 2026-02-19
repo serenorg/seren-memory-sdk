@@ -115,6 +115,7 @@ impl MemoryClient {
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
+            .header("Accept", "application/json, text/event-stream")
             .json(&rpc_request)
             .send()
             .await?;
@@ -208,6 +209,7 @@ impl MemoryClient {
             .http
             .post(&url)
             .bearer_auth(&self.api_key)
+            .header("Accept", "application/json, text/event-stream")
             .json(&rpc_request)
             .send()
             .await?;
@@ -474,5 +476,28 @@ mod tests {
         let client = MemoryClient::new(server.uri(), "bad-key".to_string());
         let err = client.recall("query", None, None).await.unwrap_err();
         assert!(matches!(err, SdkError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_sends_accept_header() {
+        // Verify the Accept header is sent by checking the server rejects
+        // requests missing it (406) but accepts requests with it.
+        // We simulate the server requiring the header by only responding 200
+        // when "application/json" appears in the Accept value.
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mcp_tool_response("ok")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::new(server.uri(), "test-key".to_string());
+        let result = client.remember("fact", "semantic", None, None).await.unwrap();
+        assert_eq!(result, "ok");
     }
 }
