@@ -224,13 +224,61 @@ impl MemoryClient {
             return Err(SdkError::ServerError { status, body });
         }
 
-        let rpc_response: serde_json::Value = resp.json().await?;
+        // The MCP server may return SSE (text/event-stream) or plain JSON
+        // depending on the Accept header negotiation. Parse both formats.
+        let is_sse = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        let body_text = resp.text().await?;
+
+        let json_str = if is_sse {
+            extract_sse_json(&body_text)?
+        } else {
+            body_text
+        };
+
+        let rpc_response: serde_json::Value = serde_json::from_str(&json_str)?;
 
         rpc_response["result"]["content"][0]["text"]
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| SdkError::Other("unexpected MCP response format".to_string()))
     }
+}
+
+/// Extract JSON from an SSE response body.
+///
+/// SSE format: lines prefixed with `data: ` contain the payload.
+/// Concatenates all `data:` payloads (skipping comments and blank lines)
+/// and returns the combined JSON string.
+fn extract_sse_json(body: &str) -> SdkResult<String> {
+    let mut json_parts = Vec::new();
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data == "[DONE]" {
+                break;
+            }
+            json_parts.push(data);
+        } else if let Some(data) = line.strip_prefix("data:") {
+            if data.trim() == "[DONE]" {
+                break;
+            }
+            json_parts.push(data.trim());
+        }
+    }
+
+    if json_parts.is_empty() {
+        return Err(SdkError::Other(
+            "SSE response contained no data lines".to_string(),
+        ));
+    }
+
+    // MCP tool responses are single JSON objects in one data line
+    Ok(json_parts.join(""))
 }
 
 /// Request body for pushing a memory to the cloud.
@@ -505,5 +553,55 @@ mod tests {
         let client = MemoryClient::new(server.uri(), "test-key".to_string());
         let result = client.remember("fact", "semantic", None, None).await.unwrap();
         assert_eq!(result, "ok");
+    }
+
+    #[tokio::test]
+    async fn remember_handles_sse_response() {
+        let server = MockServer::start().await;
+
+        // Simulate the server returning SSE format (text/event-stream)
+        let sse_body = format!(
+            "data: {}\n\n",
+            serde_json::to_string(&mcp_tool_response("SSE memory stored")).unwrap()
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::new(server.uri(), "test-key".to_string());
+        let result = client
+            .remember("test fact", "semantic", None, None)
+            .await
+            .unwrap();
+        assert_eq!(result, "SSE memory stored");
+    }
+
+    #[test]
+    fn extract_sse_json_parses_data_lines() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n\ndata: [DONE]\n\n";
+        let result = extract_sse_json(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["result"]["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn extract_sse_json_skips_comments() {
+        let body = ": comment\ndata: {\"id\":1}\n\n";
+        let result = extract_sse_json(body).unwrap();
+        assert_eq!(result, "{\"id\":1}");
+    }
+
+    #[test]
+    fn extract_sse_json_empty_body_errors() {
+        let result = extract_sse_json("");
+        assert!(result.is_err());
     }
 }
