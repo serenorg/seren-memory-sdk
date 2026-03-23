@@ -143,10 +143,14 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/api/memories"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "id": cloud_id.to_string() })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "memory_id": cloud_id.to_string(),
+                "action_taken": "add",
+                "superseded_memory_id": null,
+                "reason": null,
+                "edges_created": 0,
+                "enrichments_triggered": 1
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -206,10 +210,14 @@ mod tests {
         // Push response
         Mock::given(method("POST"))
             .and(path("/api/memories"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "id": cloud_id.to_string() })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "memory_id": cloud_id.to_string(),
+                "action_taken": "add",
+                "superseded_memory_id": null,
+                "reason": null,
+                "edges_created": 0,
+                "enrichments_triggered": 1
+            })))
             .mount(&server)
             .await;
 
