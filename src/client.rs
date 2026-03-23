@@ -54,7 +54,7 @@ impl MemoryClient {
         }
 
         let created: PushMemoryResponse = resp.json().await?;
-        Ok(created.id)
+        Ok(created.memory_id)
     }
 
     /// Pull memories created after `since` from the cloud.
@@ -244,7 +244,7 @@ pub struct PushMemoryRequest {
 /// Response from pushing a memory.
 #[derive(Debug, serde::Deserialize)]
 struct PushMemoryResponse {
-    id: Uuid,
+    memory_id: Uuid,
 }
 
 /// Response from pulling memories.
@@ -268,8 +268,14 @@ mod tests {
             .and(path("/api/memories"))
             .and(header("authorization", "Bearer test-key"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "id": cloud_id.to_string() })),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "memory_id": cloud_id.to_string(),
+                    "action_taken": "add",
+                    "superseded_memory_id": null,
+                    "reason": null,
+                    "edges_created": 0,
+                    "enrichments_triggered": 1
+                })),
             )
             .expect(1)
             .mount(&server)
