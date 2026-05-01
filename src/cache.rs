@@ -8,8 +8,13 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use uuid::Uuid;
 
+use std::collections::HashMap;
+
 use crate::error::SdkResult;
-use crate::models::CachedMemory;
+use crate::models::{CachedMemory, RankedCachedMemory};
+
+/// Reciprocal Rank Fusion constant — matches the cloud recall implementation.
+const RRF_K: f64 = 60.0;
 
 /// Register sqlite-vec as an auto-extension (once per process).
 fn register_vec_extension() {
@@ -67,18 +72,78 @@ impl LocalCache {
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
                 id TEXT PRIMARY KEY,
                 embedding float[1536]
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts_memories USING fts5(
+                id UNINDEXED,
+                content,
+                memory_type,
+                tokenize='porter unicode61'
             );",
         )?;
 
+        self.backfill_fts_if_needed()?;
         Ok(())
     }
 
-    /// Insert a memory into the local cache.
+    /// Populate `fts_memories` from `cached_memories` exactly once per cache
+    /// (idempotent across cold-starts via the `fts_backfilled` sync_state key).
+    fn backfill_fts_if_needed(&self) -> SdkResult<()> {
+        let already: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = 'fts_backfilled'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        if already.as_deref() == Some("1") {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, content, memory_type FROM cached_memories",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO fts_memories (id, content, memory_type) VALUES (?1, ?2, ?3)",
+            )?;
+            for (id, content, mtype) in &rows {
+                ins.execute(rusqlite::params![id, content, mtype])?;
+            }
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (key, value) VALUES ('fts_backfilled', '1')",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert a memory into the local cache. All three tables
+    /// (`cached_memories`, `vec_memories`, `fts_memories`) are updated
+    /// atomically inside a single transaction.
     pub fn insert_memory(&self, memory: &CachedMemory) -> SdkResult<()> {
         let embedding_bytes = f32_slice_to_bytes(&memory.embedding);
         let id_str = memory.id.to_string();
 
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+
+        tx.execute(
             "INSERT OR REPLACE INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
@@ -94,26 +159,51 @@ impl LocalCache {
             ],
         )?;
 
-        // vec0 doesn't support INSERT OR REPLACE — delete first, then insert.
-        self.conn.execute(
+        // vec0 and fts5 don't support INSERT OR REPLACE — delete first, then insert.
+        tx.execute(
             "DELETE FROM vec_memories WHERE id = ?1",
             rusqlite::params![id_str],
         )?;
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO vec_memories (id, embedding) VALUES (?1, ?2)",
             rusqlite::params![id_str, embedding_bytes],
         )?;
 
+        tx.execute(
+            "DELETE FROM fts_memories WHERE id = ?1",
+            rusqlite::params![id_str],
+        )?;
+        tx.execute(
+            "INSERT INTO fts_memories (id, content, memory_type) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id_str, memory.content, memory.memory_type],
+        )?;
+
+        tx.commit()?;
         Ok(())
     }
 
     /// Search for similar memories using vector similarity.
     pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> SdkResult<Vec<CachedMemory>> {
+        Ok(self
+            .vector_search_scored(query_embedding, limit)?
+            .into_iter()
+            .map(|(memory, _)| memory)
+            .collect())
+    }
+
+    /// Vector search returning each match alongside its raw vec0 distance
+    /// (smaller = more similar). Used by `hybrid_search` to expose
+    /// `vector_score` to callers.
+    fn vector_search_scored(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> SdkResult<Vec<(CachedMemory, f64)>> {
         let query_bytes = f32_slice_to_bytes(query_embedding);
 
         let mut stmt = self.conn.prepare(
             "SELECT cm.id, cm.content, cm.memory_type, cm.metadata, cm.embedding,
-                    cm.relevance_score, cm.created_at, cm.synced, cm.cloud_id
+                    cm.relevance_score, cm.created_at, cm.synced, cm.cloud_id, v.distance
              FROM vec_memories v
              INNER JOIN cached_memories cm ON cm.id = v.id
              WHERE v.embedding MATCH ?1 AND k = ?2
@@ -121,19 +211,153 @@ impl LocalCache {
         )?;
 
         let rows = stmt.query_map(rusqlite::params![query_bytes, limit as i64], |row| {
-            Ok(parse_memory_row(row))
+            let parsed = parse_memory_row(row);
+            let distance: f64 = row.get(9)?;
+            Ok((parsed, distance))
         })?;
 
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(Ok(memory)) => results.push(memory),
-                Ok(Err(e)) => tracing::warn!("failed to parse cached memory: {e}"),
+                Ok((Ok(memory), distance)) => results.push((memory, distance)),
+                Ok((Err(e), _)) => tracing::warn!("failed to parse cached memory: {e}"),
                 Err(e) => tracing::warn!("failed to read row: {e}"),
             }
         }
 
         Ok(results)
+    }
+
+    /// Keyword search over the FTS5 index. Returns each hit alongside its
+    /// BM25-derived score (positive — larger = better match).
+    ///
+    /// `query` is passed straight to FTS5; callers that accept untrusted
+    /// input should sanitize/quote tokens to avoid FTS5 query-syntax errors.
+    pub fn keyword_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> SdkResult<Vec<(CachedMemory, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cm.id, cm.content, cm.memory_type, cm.metadata, cm.embedding,
+                    cm.relevance_score, cm.created_at, cm.synced, cm.cloud_id, fts_memories.rank
+             FROM fts_memories
+             INNER JOIN cached_memories cm ON cm.id = fts_memories.id
+             WHERE fts_memories MATCH ?1
+             ORDER BY fts_memories.rank
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
+            let parsed = parse_memory_row(row);
+            let rank: f64 = row.get(9)?;
+            Ok((parsed, rank))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                // FTS5 `rank` is negative (smaller = better). Flip sign so the
+                // returned score is positive and orderable as "higher is better".
+                Ok((Ok(memory), rank)) => results.push((memory, -rank)),
+                Ok((Err(e), _)) => tracing::warn!("failed to parse fts row: {e}"),
+                Err(e) => tracing::warn!("failed to read fts row: {e}"),
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Hybrid retrieval: BM25 keyword + vec0 vector, fused via Reciprocal
+    /// Rank Fusion (K=60). Mirrors the cloud `seren-memory` recall shape so
+    /// degraded-mode recall feels like memory, not chronology.
+    ///
+    /// When `query_embedding` is `None`, falls back to keyword-only.
+    pub fn hybrid_search(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        limit: usize,
+    ) -> SdkResult<Vec<RankedCachedMemory>> {
+        // Pull a wider pool from each source so the fusion has room to reorder.
+        let pool = limit.saturating_mul(2).max(limit);
+
+        let keyword_hits = self.keyword_search(query, pool)?;
+
+        let Some(embedding) = query_embedding else {
+            // Keyword-only fallback. Surface BM25 as the ranking score so
+            // callers still get a comparable `rrf_score` field populated.
+            let mut out: Vec<RankedCachedMemory> = keyword_hits
+                .into_iter()
+                .map(|(memory, bm25)| RankedCachedMemory {
+                    memory,
+                    rrf_score: bm25,
+                    vector_score: None,
+                    bm25_score: Some(bm25),
+                })
+                .collect();
+            out.truncate(limit);
+            return Ok(out);
+        };
+
+        let vector_hits = self.vector_search_scored(embedding, pool)?;
+
+        // Aggregate by id: sum RRF contributions, remember each side's raw score.
+        struct Acc {
+            rrf: f64,
+            vector_score: Option<f64>,
+            bm25_score: Option<f64>,
+            memory: CachedMemory,
+        }
+        let mut acc: HashMap<Uuid, Acc> = HashMap::new();
+
+        for (rank, (memory, bm25)) in keyword_hits.into_iter().enumerate() {
+            let contribution = 1.0 / (RRF_K + (rank + 1) as f64);
+            acc.entry(memory.id)
+                .and_modify(|e| {
+                    e.rrf += contribution;
+                    e.bm25_score = Some(bm25);
+                })
+                .or_insert(Acc {
+                    rrf: contribution,
+                    vector_score: None,
+                    bm25_score: Some(bm25),
+                    memory,
+                });
+        }
+
+        for (rank, (memory, distance)) in vector_hits.into_iter().enumerate() {
+            let contribution = 1.0 / (RRF_K + (rank + 1) as f64);
+            acc.entry(memory.id)
+                .and_modify(|e| {
+                    e.rrf += contribution;
+                    e.vector_score = Some(distance);
+                })
+                .or_insert(Acc {
+                    rrf: contribution,
+                    vector_score: Some(distance),
+                    bm25_score: None,
+                    memory,
+                });
+        }
+
+        let mut ranked: Vec<RankedCachedMemory> = acc
+            .into_values()
+            .map(|a| RankedCachedMemory {
+                memory: a.memory,
+                rrf_score: a.rrf,
+                vector_score: a.vector_score,
+                bm25_score: a.bm25_score,
+            })
+            .collect();
+
+        ranked.sort_by(|a, b| {
+            b.rrf_score
+                .partial_cmp(&a.rrf_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        ranked.truncate(limit);
+        Ok(ranked)
     }
 
     /// Get all memories that haven't been synced to the cloud yet.
@@ -390,5 +614,133 @@ mod tests {
 
         let _cache = LocalCache::open(&path).unwrap();
         assert!(path.exists());
+    }
+
+    /// Backfill must populate FTS from pre-existing `cached_memories` rows on
+    /// the first open after upgrade, then never run again. We simulate the
+    /// upgrade by inserting raw rows into `cached_memories` (bypassing the
+    /// FTS write) and clearing the `fts_backfilled` flag, then reopening.
+    #[test]
+    fn backfill_runs_exactly_once_across_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill.db");
+
+        // First open: insert a pre-FTS row directly, then unset the flag.
+        let cache = LocalCache::open(&path).unwrap();
+        let id = Uuid::new_v4();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id)
+                 VALUES (?1, ?2, ?3, '{}', ?4, 1.0, ?5, 0, NULL)",
+                rusqlite::params![
+                    id.to_string(),
+                    "pnpm install fails offline",
+                    "semantic",
+                    f32_slice_to_bytes(&vec![0.0; 1536]),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        cache
+            .conn
+            .execute("DELETE FROM sync_state WHERE key = 'fts_backfilled'", [])
+            .unwrap();
+        drop(cache);
+
+        // Second open: backfill should populate FTS for the orphaned row.
+        let cache = LocalCache::open(&path).unwrap();
+        let hits = cache.keyword_search("pnpm", 10).unwrap();
+        assert_eq!(hits.len(), 1, "backfill should index existing rows");
+        assert_eq!(hits[0].0.id, id);
+
+        // Third open: the flag is set, so backfill must NOT re-insert
+        // (which would either duplicate or — given fts5 has no PK — silently
+        // pollute the index).
+        drop(cache);
+        let cache = LocalCache::open(&path).unwrap();
+        let hits = cache.keyword_search("pnpm", 10).unwrap();
+        assert_eq!(hits.len(), 1, "backfill must run exactly once");
+    }
+
+    /// BM25 ranks documents with stronger keyword presence higher. The
+    /// ranking score returned by `keyword_search` is positive — bigger is
+    /// better — so we just check the order matches BM25 expectations.
+    #[test]
+    fn keyword_search_returns_bm25_ranked_matches() {
+        let cache = LocalCache::open_in_memory().unwrap();
+
+        let strong = test_memory("pnpm pnpm pnpm install loop", false);
+        let weak = test_memory("pnpm install fails offline once", false);
+        let unrelated = test_memory("git push origin main", false);
+
+        cache.insert_memory(&strong).unwrap();
+        cache.insert_memory(&weak).unwrap();
+        cache.insert_memory(&unrelated).unwrap();
+
+        let hits = cache.keyword_search("pnpm", 10).unwrap();
+
+        assert_eq!(hits.len(), 2, "only matching docs should be returned");
+        assert_eq!(hits[0].0.id, strong.id, "stronger BM25 match comes first");
+        assert_eq!(hits[1].0.id, weak.id);
+        assert!(
+            hits[0].1 >= hits[1].1,
+            "scores must be sorted descending (got {} then {})",
+            hits[0].1,
+            hits[1].1,
+        );
+    }
+
+    /// RRF fusion: a document that ranks #1 in one source and #2 in the
+    /// other should land above a document that ranks #2 then #1 only when
+    /// its summed RRF contribution is larger — and crucially, both
+    /// `vector_score` and `bm25_score` must be populated for documents
+    /// matched by both rankers.
+    #[test]
+    fn hybrid_search_rrf_merges_two_item_case() {
+        let cache = LocalCache::open_in_memory().unwrap();
+
+        // `a`: keyword match on "pnpm" AND closest to query embedding.
+        let mut a = test_memory("pnpm install fails", false);
+        a.embedding = vec![1.0; 1536];
+        cache.insert_memory(&a).unwrap();
+
+        // `b`: keyword match on "pnpm" but farther from query embedding.
+        let mut b = test_memory("pnpm cache corruption", false);
+        b.embedding = vec![0.5; 1536];
+        cache.insert_memory(&b).unwrap();
+
+        // `c`: no keyword match, far from query embedding.
+        let mut c = test_memory("git push fails", false);
+        c.embedding = vec![0.0; 1536];
+        cache.insert_memory(&c).unwrap();
+
+        let query_embedding = vec![1.0; 1536];
+        let ranked = cache
+            .hybrid_search("pnpm", Some(&query_embedding), 10)
+            .unwrap();
+
+        // All three appear (a/b via keyword+vector, c via vector-only).
+        assert_eq!(ranked.len(), 3);
+
+        // `a` is top-1 in both rankers → strictly highest RRF.
+        assert_eq!(ranked[0].memory.id, a.id);
+        assert!(ranked[0].rrf_score > ranked[1].rrf_score);
+
+        // The top hit was matched by both sources, so both scores populate.
+        assert!(ranked[0].vector_score.is_some());
+        assert!(ranked[0].bm25_score.is_some());
+
+        // `c` was vector-only — bm25_score must remain None.
+        let c_ranked = ranked.iter().find(|r| r.memory.id == c.id).unwrap();
+        assert!(c_ranked.bm25_score.is_none());
+        assert!(c_ranked.vector_score.is_some());
+
+        // Keyword-only fallback path must not panic and must drop the
+        // vector-only document `c` from results.
+        let keyword_only = cache.hybrid_search("pnpm", None, 10).unwrap();
+        assert_eq!(keyword_only.len(), 2);
+        assert!(keyword_only.iter().all(|r| r.vector_score.is_none()));
+        assert!(keyword_only.iter().all(|r| r.bm25_score.is_some()));
     }
 }
