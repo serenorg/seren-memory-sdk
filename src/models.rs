@@ -79,4 +79,17 @@ pub struct RecallResult {
     pub content: String,
     pub memory_type: String,
     pub relevance_score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_score: Option<f64>,
+}
+
+/// A cached memory with hybrid-search scores attached.
+#[derive(Debug, Clone)]
+pub struct RankedCachedMemory {
+    pub memory: CachedMemory,
+    pub rrf_score: f64,
+    pub vector_score: Option<f64>,
+    pub bm25_score: Option<f64>,
 }
