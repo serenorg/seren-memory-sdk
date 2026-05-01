@@ -11,7 +11,7 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::error::SdkResult;
-use crate::models::{CachedMemory, RankedCachedMemory};
+use crate::models::{CachedMemory, FeedbackSignal, RankedCachedMemory};
 
 /// Reciprocal Rank Fusion constant — matches the cloud recall implementation.
 const RRF_K: f64 = 60.0;
@@ -61,7 +61,9 @@ impl LocalCache {
                 relevance_score REAL DEFAULT 1.0,
                 created_at TEXT NOT NULL,
                 synced BOOLEAN DEFAULT 0,
-                cloud_id TEXT
+                cloud_id TEXT,
+                feedback_signal INTEGER DEFAULT NULL,
+                pinned INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -82,7 +84,48 @@ impl LocalCache {
             );",
         )?;
 
+        // SQLite has no `ADD COLUMN IF NOT EXISTS` until 3.35+, and the
+        // bundled version may predate that on some targets. We probe the
+        // current column set and only add what is missing — the result is
+        // idempotent across cold-starts and safe on caches created before
+        // these columns existed.
+        self.add_column_if_missing(
+            "cached_memories",
+            "feedback_signal",
+            "ALTER TABLE cached_memories ADD COLUMN feedback_signal INTEGER DEFAULT NULL",
+        )?;
+        self.add_column_if_missing(
+            "cached_memories",
+            "pinned",
+            "ALTER TABLE cached_memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        )?;
+
         self.backfill_fts_if_needed()?;
+        Ok(())
+    }
+
+    fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        ddl: &str,
+    ) -> SdkResult<()> {
+        // PRAGMA table_info doesn't accept bindings for the table name —
+        // this is internal-only and the values are static identifiers, so
+        // string interpolation is safe.
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        self.conn.execute(ddl, [])?;
         Ok(())
     }
 
@@ -144,8 +187,8 @@ impl LocalCache {
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
-            "INSERT OR REPLACE INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id, feedback_signal, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 id_str,
                 memory.content,
@@ -156,6 +199,8 @@ impl LocalCache {
                 memory.created_at.to_rfc3339(),
                 memory.synced as i32,
                 memory.cloud_id.map(|id| id.to_string()),
+                memory.feedback_signal,
+                memory.pinned as i32,
             ],
         )?;
 
@@ -203,7 +248,8 @@ impl LocalCache {
 
         let mut stmt = self.conn.prepare(
             "SELECT cm.id, cm.content, cm.memory_type, cm.metadata, cm.embedding,
-                    cm.relevance_score, cm.created_at, cm.synced, cm.cloud_id, v.distance
+                    cm.relevance_score, cm.created_at, cm.synced, cm.cloud_id,
+                    cm.feedback_signal, cm.pinned, v.distance
              FROM vec_memories v
              INNER JOIN cached_memories cm ON cm.id = v.id
              WHERE v.embedding MATCH ?1 AND k = ?2
@@ -212,7 +258,7 @@ impl LocalCache {
 
         let rows = stmt.query_map(rusqlite::params![query_bytes, limit as i64], |row| {
             let parsed = parse_memory_row(row);
-            let distance: f64 = row.get(9)?;
+            let distance: f64 = row.get(11)?;
             Ok((parsed, distance))
         })?;
 
@@ -240,7 +286,8 @@ impl LocalCache {
     ) -> SdkResult<Vec<(CachedMemory, f64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT cm.id, cm.content, cm.memory_type, cm.metadata, cm.embedding,
-                    cm.relevance_score, cm.created_at, cm.synced, cm.cloud_id, fts_memories.rank
+                    cm.relevance_score, cm.created_at, cm.synced, cm.cloud_id,
+                    cm.feedback_signal, cm.pinned, fts_memories.rank
              FROM fts_memories
              INNER JOIN cached_memories cm ON cm.id = fts_memories.id
              WHERE fts_memories MATCH ?1
@@ -250,7 +297,7 @@ impl LocalCache {
 
         let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
             let parsed = parse_memory_row(row);
-            let rank: f64 = row.get(9)?;
+            let rank: f64 = row.get(11)?;
             Ok((parsed, rank))
         })?;
 
@@ -364,7 +411,8 @@ impl LocalCache {
     pub fn get_pending_uploads(&self) -> SdkResult<Vec<CachedMemory>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, content, memory_type, metadata, embedding,
-                    relevance_score, created_at, synced, cloud_id
+                    relevance_score, created_at, synced, cloud_id,
+                    feedback_signal, pinned
              FROM cached_memories
              WHERE synced = 0",
         )?;
@@ -425,11 +473,51 @@ impl LocalCache {
         Ok(count as usize)
     }
 
+    /// Delete a memory and remove it from every secondary index. Atomic
+    /// across `cached_memories`, `vec_memories`, and `fts_memories`.
+    pub fn delete_memory(&self, id: Uuid) -> SdkResult<()> {
+        let id_str = id.to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM cached_memories WHERE id = ?1",
+            rusqlite::params![id_str],
+        )?;
+        tx.execute(
+            "DELETE FROM vec_memories WHERE id = ?1",
+            rusqlite::params![id_str],
+        )?;
+        tx.execute(
+            "DELETE FROM fts_memories WHERE id = ?1",
+            rusqlite::params![id_str],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist a feedback signal on a memory. Silently no-ops on unknown ids.
+    pub fn update_feedback(&self, id: Uuid, signal: FeedbackSignal) -> SdkResult<()> {
+        self.conn.execute(
+            "UPDATE cached_memories SET feedback_signal = ?1 WHERE id = ?2",
+            rusqlite::params![signal.as_i32(), id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Toggle the pinned flag on a memory. Silently no-ops on unknown ids.
+    pub fn set_pinned(&self, id: Uuid, pinned: bool) -> SdkResult<()> {
+        self.conn.execute(
+            "UPDATE cached_memories SET pinned = ?1 WHERE id = ?2",
+            rusqlite::params![pinned as i32, id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// List recent memories ordered by creation time (newest first).
     pub fn list_recent(&self, limit: usize) -> SdkResult<Vec<CachedMemory>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, content, memory_type, metadata, embedding,
-                    relevance_score, created_at, synced, cloud_id
+                    relevance_score, created_at, synced, cloud_id,
+                    feedback_signal, pinned
              FROM cached_memories
              ORDER BY created_at DESC
              LIMIT ?1",
@@ -490,6 +578,11 @@ fn parse_memory_row(row: &rusqlite::Row) -> Result<CachedMemory, String> {
     let cloud_id_str: Option<String> = row.get(8).map_err(|e| e.to_string())?;
     let cloud_id = cloud_id_str.and_then(|s| Uuid::parse_str(&s).ok());
 
+    let feedback_signal: Option<i32> = row.get(9).map_err(|e| e.to_string())?;
+
+    let pinned_int: i32 = row.get(10).map_err(|e| e.to_string())?;
+    let pinned = pinned_int != 0;
+
     Ok(CachedMemory {
         id,
         content,
@@ -500,6 +593,8 @@ fn parse_memory_row(row: &rusqlite::Row) -> Result<CachedMemory, String> {
         created_at,
         synced,
         cloud_id,
+        feedback_signal,
+        pinned,
     })
 }
 
@@ -519,6 +614,8 @@ mod tests {
             created_at: Utc::now(),
             synced,
             cloud_id: if synced { Some(Uuid::new_v4()) } else { None },
+            feedback_signal: None,
+            pinned: false,
         }
     }
 
@@ -742,5 +839,111 @@ mod tests {
         assert_eq!(keyword_only.len(), 2);
         assert!(keyword_only.iter().all(|r| r.vector_score.is_none()));
         assert!(keyword_only.iter().all(|r| r.bm25_score.is_some()));
+    }
+
+    /// `delete_memory` must remove the row from every secondary index.
+    /// Otherwise vector_search / keyword_search will keep returning the id
+    /// (the cloud-side delete already shipped, so a divergent local cache
+    /// is the visible bug).
+    #[test]
+    fn delete_memory_removes_from_all_indexes() {
+        let cache = LocalCache::open_in_memory().unwrap();
+
+        let mut mem = test_memory("kept around", false);
+        mem.embedding = vec![1.0; 1536];
+        cache.insert_memory(&mem).unwrap();
+
+        // Sanity: present in all three indexes before delete.
+        assert_eq!(cache.count().unwrap(), 1);
+        assert_eq!(cache.vector_search(&vec![1.0; 1536], 10).unwrap().len(), 1);
+        assert_eq!(cache.keyword_search("kept", 10).unwrap().len(), 1);
+
+        cache.delete_memory(mem.id).unwrap();
+
+        assert_eq!(cache.count().unwrap(), 0);
+        assert_eq!(
+            cache.vector_search(&vec![1.0; 1536], 10).unwrap().len(),
+            0,
+            "vector index must drop the deleted memory"
+        );
+        assert_eq!(
+            cache.keyword_search("kept", 10).unwrap().len(),
+            0,
+            "fts index must drop the deleted memory"
+        );
+    }
+
+    /// `update_feedback` and `set_pinned` must persist via `list_recent`.
+    /// One combined test keeps the persistence assertion crisp without
+    /// duplicating the insert/read scaffold.
+    #[test]
+    fn feedback_and_pin_state_persist() {
+        let cache = LocalCache::open_in_memory().unwrap();
+        let mem = test_memory("pinnable", false);
+        cache.insert_memory(&mem).unwrap();
+
+        cache
+            .update_feedback(mem.id, FeedbackSignal::Positive)
+            .unwrap();
+        cache.set_pinned(mem.id, true).unwrap();
+
+        let loaded = &cache.list_recent(10).unwrap()[0];
+        assert_eq!(loaded.feedback_signal, Some(1));
+        assert!(loaded.pinned);
+
+        // Negative + unpin round-trip — proves the columns are mutable, not
+        // write-once.
+        cache
+            .update_feedback(mem.id, FeedbackSignal::Negative)
+            .unwrap();
+        cache.set_pinned(mem.id, false).unwrap();
+        let loaded = &cache.list_recent(10).unwrap()[0];
+        assert_eq!(loaded.feedback_signal, Some(-1));
+        assert!(!loaded.pinned);
+    }
+
+    /// Schema migration must be idempotent on caches created before the
+    /// new columns existed. We simulate that by dropping the columns from
+    /// a fresh DB, then reopening to confirm the migration adds them
+    /// without erroring on subsequent reopens.
+    #[test]
+    fn schema_migration_idempotent_across_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+
+        // Build a "legacy" cached_memories table without the new columns.
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE cached_memories (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    memory_type TEXT NOT NULL,
+                    metadata TEXT DEFAULT '{}',
+                    embedding BLOB NOT NULL,
+                    relevance_score REAL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    synced BOOLEAN DEFAULT 0,
+                    cloud_id TEXT
+                );",
+            )
+            .unwrap();
+        drop(legacy);
+
+        // First open: migration adds feedback_signal + pinned.
+        let cache = LocalCache::open(&path).unwrap();
+        let mem = test_memory("legacy row", false);
+        cache.insert_memory(&mem).unwrap();
+        cache
+            .update_feedback(mem.id, FeedbackSignal::Positive)
+            .unwrap();
+        drop(cache);
+
+        // Second open: migration must no-op (no duplicate-column error)
+        // and the persisted feedback/pinned values must round-trip.
+        let cache = LocalCache::open(&path).unwrap();
+        let loaded = &cache.list_recent(10).unwrap()[0];
+        assert_eq!(loaded.feedback_signal, Some(1));
+        assert!(!loaded.pinned);
     }
 }

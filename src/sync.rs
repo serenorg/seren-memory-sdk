@@ -100,6 +100,8 @@ impl SyncEngine {
                 created_at: cloud_mem.created_at,
                 synced: true,
                 cloud_id: Some(cloud_mem.id),
+                feedback_signal: None,
+                pinned: cloud_mem.is_pinned,
             };
 
             self.cache.insert_memory(&cached)?;
@@ -133,6 +135,8 @@ mod tests {
             created_at: Utc::now(),
             synced: false,
             cloud_id: None,
+            feedback_signal: None,
+            pinned: false,
         }
     }
 
