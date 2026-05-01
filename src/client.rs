@@ -6,7 +6,9 @@ use reqwest::Client;
 use uuid::Uuid;
 
 use crate::error::{SdkError, SdkResult};
-use crate::models::{BootstrapInput, CloudMemory, CloudSessionContext, RecallResult};
+use crate::models::{
+    BootstrapInput, CloudMemory, CloudSessionContext, FeedbackSignal, RecallResult,
+};
 
 pub struct MemoryClient {
     base_url: String,
@@ -187,6 +189,35 @@ impl MemoryClient {
         Ok(results)
     }
 
+    /// Delete a memory by id via the cloud MCP `delete_memory` tool.
+    pub async fn delete_memory(&self, id: Uuid) -> SdkResult<()> {
+        let args = serde_json::json!({ "memory_id": id });
+        self.call_mcp_tool("delete_memory", args).await?;
+        Ok(())
+    }
+
+    /// Record a feedback signal on a memory via the cloud MCP `mark_feedback`
+    /// tool. The wire payload uses `+1` / `-1` integers for the signal.
+    pub async fn mark_feedback(&self, id: Uuid, signal: FeedbackSignal) -> SdkResult<()> {
+        let args = serde_json::json!({
+            "memory_id": id,
+            "signal": signal.as_i32(),
+        });
+        self.call_mcp_tool("mark_feedback", args).await?;
+        Ok(())
+    }
+
+    /// Toggle the pin state of a memory via the cloud MCP `update_memory`
+    /// tool with the `is_pinned` field set.
+    pub async fn toggle_pin(&self, id: Uuid, pinned: bool) -> SdkResult<()> {
+        let args = serde_json::json!({
+            "memory_id": id,
+            "is_pinned": pinned,
+        });
+        self.call_mcp_tool("update_memory", args).await?;
+        Ok(())
+    }
+
     /// Send a JSON-RPC tools/call request to the MCP endpoint.
     async fn call_mcp_tool(
         &self,
@@ -304,7 +335,8 @@ struct PullMemoriesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use crate::models::FeedbackSignal;
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -491,12 +523,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_returns_results() {
+    async fn recall_returns_results_with_ids() {
         let server = MockServer::start().await;
 
+        let id_one = Uuid::new_v4();
+        let id_two = Uuid::new_v4();
         let results = serde_json::json!([
-            { "content": "Axum 0.8 is used", "memory_type": "semantic", "relevance_score": 0.95 },
-            { "content": "Use snake_case", "memory_type": "convention", "relevance_score": 0.8 }
+            { "id": id_one, "content": "Axum 0.8 is used", "memory_type": "semantic", "relevance_score": 0.95 },
+            { "id": id_two, "content": "Use snake_case", "memory_type": "convention", "relevance_score": 0.8 }
         ]);
 
         Mock::given(method("POST"))
@@ -513,7 +547,9 @@ mod tests {
         let client = MemoryClient::new(server.uri(), "test-key".to_string());
         let results = client.recall("what framework", None, Some(5)).await.unwrap();
         assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, id_one, "recall must surface cloud memory ids");
         assert_eq!(results[0].content, "Axum 0.8 is used");
+        assert_eq!(results[1].id, id_two);
         assert_eq!(results[1].memory_type, "convention");
     }
 
@@ -603,5 +639,62 @@ mod tests {
     fn extract_sse_json_empty_body_errors() {
         let result = extract_sse_json("");
         assert!(result.is_err());
+    }
+
+    /// Each mutation must call its own MCP tool with a body that carries
+    /// `memory_id` and the tool-specific payload. We verify the body shape
+    /// via `body_partial_json` so the mock fails the request if the SDK
+    /// names the tool wrong or drops a field.
+    #[tokio::test]
+    async fn mutations_call_their_mcp_tools_with_correct_payloads() {
+        let server = MockServer::start().await;
+        let mem_id = Uuid::new_v4();
+
+        // delete_memory → tool name "delete_memory", carries memory_id
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": { "name": "delete_memory", "arguments": { "memory_id": mem_id } }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mcp_tool_response("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // mark_feedback → "mark_feedback", carries signal as -1 / +1 integer
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": {
+                    "name": "mark_feedback",
+                    "arguments": { "memory_id": mem_id, "signal": -1 }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mcp_tool_response("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // toggle_pin → "update_memory" with is_pinned (matches cloud schema)
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": {
+                    "name": "update_memory",
+                    "arguments": { "memory_id": mem_id, "is_pinned": true }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mcp_tool_response("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::new(server.uri(), "test-key".to_string());
+        client.delete_memory(mem_id).await.unwrap();
+        client
+            .mark_feedback(mem_id, FeedbackSignal::Negative)
+            .await
+            .unwrap();
+        client.toggle_pin(mem_id, true).await.unwrap();
     }
 }

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::cache::LocalCache;
 use crate::client::MemoryClient;
 use crate::error::SdkResult;
-use crate::models::{BootstrapInput, ContextSource, SessionContext};
+use crate::models::{BootstrapInput, ContextSource, MemoryRef, SessionContext};
 
 pub struct BootstrapOrchestrator {
     cache: LocalCache,
@@ -55,7 +55,7 @@ impl BootstrapOrchestrator {
     fn bootstrap_from_cache(&self, token_budget: usize) -> SdkResult<SessionContext> {
         let memories = self.cache.list_recent(50)?;
 
-        let mut memories_by_type: HashMap<String, Vec<String>> = HashMap::new();
+        let mut memories_by_type: HashMap<String, Vec<MemoryRef>> = HashMap::new();
         let mut total_tokens = 0;
 
         for mem in &memories {
@@ -65,10 +65,17 @@ impl BootstrapOrchestrator {
             }
             total_tokens += estimated_tokens;
 
+            // Surface the cloud-side id when we have one (so frontends can
+            // mutate the original memory) and fall back to the local id
+            // otherwise — preserves the "carry IDs end-to-end" invariant.
+            let id = mem.cloud_id.unwrap_or(mem.id);
             memories_by_type
                 .entry(mem.memory_type.clone())
                 .or_default()
-                .push(mem.content.clone());
+                .push(MemoryRef {
+                    id,
+                    content: mem.content.clone(),
+                });
         }
 
         let total_memories = memories_by_type.values().map(|v| v.len()).sum();
@@ -84,7 +91,7 @@ impl BootstrapOrchestrator {
 }
 
 /// Format memories into a structured markdown prompt section.
-fn format_prompt(memories_by_type: &HashMap<String, Vec<String>>) -> String {
+fn format_prompt(memories_by_type: &HashMap<String, Vec<MemoryRef>>) -> String {
     if memories_by_type.is_empty() {
         return String::new();
     }
@@ -119,7 +126,7 @@ fn format_prompt(memories_by_type: &HashMap<String, Vec<String>>) -> String {
 
         sections.push(format!("### {heading}"));
         for item in items {
-            sections.push(format!("- {item}"));
+            sections.push(format!("- {}", item.content));
         }
         sections.push(String::new());
     }
@@ -146,6 +153,8 @@ mod tests {
             created_at: Utc::now(),
             synced: true,
             cloud_id: Some(Uuid::new_v4()),
+            feedback_signal: None,
+            pinned: false,
         };
         cache.insert_memory(&mem).unwrap();
     }
@@ -241,23 +250,65 @@ mod tests {
         assert!(ctx.total_memories > 0);
     }
 
+    fn mref(content: &str) -> MemoryRef {
+        MemoryRef {
+            id: Uuid::new_v4(),
+            content: content.to_string(),
+        }
+    }
+
     #[test]
     fn format_prompt_groups_by_type() {
         let mut memories = HashMap::new();
         memories.insert(
             "semantic".to_string(),
-            vec!["Fact one".to_string(), "Fact two".to_string()],
+            vec![mref("Fact one"), mref("Fact two")],
         );
-        memories.insert(
-            "convention".to_string(),
-            vec!["Use snake_case".to_string()],
-        );
+        memories.insert("convention".to_string(), vec![mref("Use snake_case")]);
 
         let prompt = format_prompt(&memories);
         assert!(prompt.contains("### Convention"));
         assert!(prompt.contains("### Semantic"));
         assert!(prompt.contains("- Fact one"));
         assert!(prompt.contains("- Use snake_case"));
+    }
+
+    /// SessionContext must carry `MemoryRef` ids end-to-end. The cloud path
+    /// already returns objects with ids; the offline cache path was the
+    /// regression risk, so we exercise it directly.
+    #[tokio::test]
+    async fn cache_bootstrap_propagates_memory_ids() {
+        let cache = LocalCache::open_in_memory().unwrap();
+        let cloud_id = Uuid::new_v4();
+        let mem = CachedMemory {
+            id: Uuid::new_v4(),
+            content: "Use snake_case".to_string(),
+            memory_type: "convention".to_string(),
+            metadata: serde_json::json!({}),
+            embedding: vec![0.1; 1536],
+            relevance_score: 1.0,
+            created_at: Utc::now(),
+            synced: true,
+            cloud_id: Some(cloud_id),
+            feedback_signal: None,
+            pinned: false,
+        };
+        cache.insert_memory(&mem).unwrap();
+
+        // Unreachable cloud → forces the local-cache path.
+        let client = MemoryClient::new("http://localhost:1".to_string(), "key".to_string());
+        let orchestrator = BootstrapOrchestrator::new(cache, client);
+
+        let ctx = orchestrator.bootstrap(None, None, None).await.unwrap();
+        assert_eq!(ctx.source, ContextSource::LocalCache);
+
+        let refs = ctx.memories_by_type.get("convention").expect("type missing");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].id, cloud_id,
+            "cache path must surface cloud_id when present (not the local row id)"
+        );
+        assert_eq!(refs[0].content, "Use snake_case");
     }
 
     #[test]
