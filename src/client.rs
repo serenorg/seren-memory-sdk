@@ -1,6 +1,8 @@
 // ABOUTME: HTTP client for the seren-memory cloud API.
 // ABOUTME: Handles push/pull of memories and session bootstrap requests.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use uuid::Uuid;
@@ -10,6 +12,9 @@ use crate::models::{
     BootstrapInput, CloudMemory, CloudSessionContext, FeedbackSignal, RecallResult,
 };
 
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct MemoryClient {
     base_url: String,
     api_key: String,
@@ -18,11 +23,31 @@ pub struct MemoryClient {
 
 impl MemoryClient {
     pub fn new(base_url: String, api_key: String) -> Self {
-        Self {
+        Self::with_timeouts(
             base_url,
             api_key,
-            http: Client::new(),
-        }
+            DEFAULT_CONNECT_TIMEOUT,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .expect("default HTTP client configuration must be valid")
+    }
+
+    /// Build a client with caller-selected connect and total request deadlines.
+    pub fn with_timeouts(
+        base_url: String,
+        api_key: String,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> SdkResult<Self> {
+        let http = Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .build()?;
+        Ok(Self {
+            base_url,
+            api_key,
+            http,
+        })
     }
 
     pub fn base_url(&self) -> &str {
@@ -520,6 +545,36 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SdkError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_bounds_a_stalled_server() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(1))
+                    .set_body_json(mcp_tool_response("too late")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::with_timeouts(
+            server.uri(),
+            "test-key".to_string(),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let error = client
+            .remember("test", "semantic", None, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SdkError::Http(ref error) if error.is_timeout()));
     }
 
     #[tokio::test]
