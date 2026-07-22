@@ -3,7 +3,6 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use reqwest::Client;
 use uuid::Uuid;
 
@@ -60,64 +59,33 @@ impl MemoryClient {
 
     /// Push a single memory to the cloud. Returns the cloud-assigned UUID.
     pub async fn push_memory(&self, memory: &PushMemoryRequest) -> SdkResult<Uuid> {
-        let url = format!("{}/api/memories", self.base_url);
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(memory)
-            .send()
+        let text = self
+            .call_mcp_tool(
+                "remember",
+                serde_json::to_value(memory).map_err(SdkError::Serialization)?,
+            )
             .await?;
+        let output: serde_json::Value = serde_json::from_str(&text)?;
+        let memory_id = output
+            .get("memory_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SdkError::Other("remember response missing memory_id".to_string()))?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SdkError::Unauthorized);
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SdkError::ServerError { status, body });
-        }
-
-        let created: PushMemoryResponse = resp.json().await?;
-        Ok(created.memory_id)
+        Uuid::parse_str(memory_id).map_err(|error| {
+            SdkError::Other(format!("remember response has invalid memory_id: {error}"))
+        })
     }
 
-    /// Pull memories created after `since` from the cloud.
-    pub async fn pull_memories(
-        &self,
-        _user_id: Uuid,
-        project_id: Option<Uuid>,
-        since: Option<DateTime<Utc>>,
-    ) -> SdkResult<Vec<CloudMemory>> {
-        let mut url = format!("{}/api/memories?limit=100", self.base_url);
-
-        if let Some(ts) = since {
-            url.push_str(&format!("&created_after={}", ts.to_rfc3339()));
-        }
+    /// Pull memories from the cloud. The caller applies its local timestamp
+    /// filter because the MCP list tool does not accept a created-after filter.
+    pub async fn pull_memories(&self, project_id: Option<Uuid>) -> SdkResult<Vec<CloudMemory>> {
+        let mut args = serde_json::json!({ "limit": 100 });
         if let Some(pid) = project_id {
-            url.push_str(&format!("&project_id={pid}"));
+            args["project_id"] = serde_json::json!(pid);
         }
 
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
-
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SdkError::Unauthorized);
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SdkError::ServerError { status, body });
-        }
-
-        let body: PullMemoriesResponse = resp.json().await?;
+        let text = self.call_mcp_tool("list_memories", args).await?;
+        let body: PullMemoriesResponse = serde_json::from_str(&text)?;
         Ok(body.memories)
     }
 
@@ -326,18 +294,18 @@ fn extract_sse_json(body: &str) -> SdkResult<String> {
     Ok(json_parts.join(""))
 }
 
-/// Request body for pushing a memory to the cloud.
+/// Arguments for pushing a memory through the cloud MCP `remember` tool.
 #[derive(Debug, serde::Serialize)]
 pub struct PushMemoryRequest {
     pub content: String,
     pub memory_type: String,
     pub metadata: serde_json::Value,
-}
-
-/// Response from pushing a memory.
-#[derive(Debug, serde::Deserialize)]
-struct PushMemoryResponse {
-    memory_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pin: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<Uuid>,
 }
 
 /// Response from pulling memories.
@@ -359,18 +327,14 @@ mod tests {
 
         let cloud_id = Uuid::new_v4();
         Mock::given(method("POST"))
-            .and(path("/api/memories"))
+            .and(path("/mcp"))
             .and(header("authorization", "Bearer test-key"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "memory_id": cloud_id.to_string(),
-                    "action_taken": "add",
-                    "superseded_memory_id": null,
-                    "reason": null,
-                    "edges_created": 0,
-                    "enrichments_triggered": 1
-                })),
-            )
+            .and(body_partial_json(serde_json::json!({
+                "params": { "name": "remember" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mcp_tool_response(
+                &serde_json::json!({ "memory_id": cloud_id }).to_string(),
+            )))
             .expect(1)
             .mount(&server)
             .await;
@@ -380,6 +344,9 @@ mod tests {
             content: "test memory".to_string(),
             memory_type: "semantic".to_string(),
             metadata: serde_json::json!({}),
+            pin: None,
+            project_id: None,
+            org_id: None,
         };
 
         let result = client.push_memory(&req).await.unwrap();
@@ -391,7 +358,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/api/memories"))
+            .and(path("/mcp"))
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
@@ -401,6 +368,9 @@ mod tests {
             content: "test".to_string(),
             memory_type: "semantic".to_string(),
             metadata: serde_json::json!({}),
+            pin: None,
+            project_id: None,
+            org_id: None,
         };
 
         let err = client.push_memory(&req).await.unwrap_err();
@@ -412,7 +382,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/api/memories"))
+            .and(path("/mcp"))
             .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
             .mount(&server)
             .await;
@@ -422,6 +392,9 @@ mod tests {
             content: "test".to_string(),
             memory_type: "semantic".to_string(),
             metadata: serde_json::json!({}),
+            pin: None,
+            project_id: None,
+            org_id: None,
         };
 
         let err = client.push_memory(&req).await.unwrap_err();
@@ -439,28 +412,34 @@ mod tests {
         let server = MockServer::start().await;
 
         let mem_id = Uuid::new_v4();
-        Mock::given(method("GET"))
-            .and(path("/api/memories"))
+        let list_response = serde_json::json!({
+            "memories": [{
+                "id": mem_id.to_string(),
+                "content": "pulled memory",
+                "memory_type": "semantic",
+                "metadata": {},
+                "relevance_score": 1.0,
+                "is_pinned": false,
+                "created_at": "2026-02-06T00:00:00Z",
+                "updated_at": "2026-02-06T00:00:00Z"
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
             .and(header("authorization", "Bearer test-key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "memories": [{
-                    "id": mem_id.to_string(),
-                    "content": "pulled memory",
-                    "memory_type": "semantic",
-                    "metadata": {},
-                    "relevance_score": 1.0,
-                    "is_pinned": false,
-                    "created_at": "2026-02-06T00:00:00Z",
-                    "updated_at": "2026-02-06T00:00:00Z"
-                }]
+            .and(body_partial_json(serde_json::json!({
+                "params": { "name": "list_memories" }
             })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mcp_tool_response(&list_response.to_string())),
+            )
             .expect(1)
             .mount(&server)
             .await;
 
         let client = MemoryClient::new(server.uri(), "test-key".to_string());
-        let user_id = Uuid::new_v4();
-        let memories = client.pull_memories(user_id, None, None).await.unwrap();
+        let memories = client.pull_memories(None).await.unwrap();
 
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].content, "pulled memory");
@@ -471,17 +450,14 @@ mod tests {
     async fn pull_memories_returns_unauthorized() {
         let server = MockServer::start().await;
 
-        Mock::given(method("GET"))
-            .and(path("/api/memories"))
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
 
         let client = MemoryClient::new(server.uri(), "bad-key".to_string());
-        let err = client
-            .pull_memories(Uuid::new_v4(), None, None)
-            .await
-            .unwrap_err();
+        let err = client.pull_memories(None).await.unwrap_err();
         assert!(matches!(err, SdkError::Unauthorized));
     }
 

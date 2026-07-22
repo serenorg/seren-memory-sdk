@@ -11,7 +11,7 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::error::SdkResult;
-use crate::models::{CachedMemory, FeedbackSignal, RankedCachedMemory};
+use crate::models::{CachedMemory, FeedbackSignal, PendingUpload, RankedCachedMemory};
 
 /// Reciprocal Rank Fusion constant — matches the cloud recall implementation.
 const RRF_K: f64 = 60.0;
@@ -516,21 +516,21 @@ impl LocalCache {
     }
 
     /// Get all memories that haven't been synced to the cloud yet.
-    pub fn get_pending_uploads(&self) -> SdkResult<Vec<CachedMemory>> {
+    pub fn get_pending_uploads(&self) -> SdkResult<Vec<PendingUpload>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, content, memory_type, metadata, embedding,
                     relevance_score, created_at, synced, cloud_id,
-                    feedback_signal, pinned
+                    feedback_signal, pinned, project_id, org_id
              FROM cached_memories
              WHERE synced = 0",
         )?;
 
-        let rows = stmt.query_map([], |row| Ok(parse_memory_row(row)))?;
+        let rows = stmt.query_map([], |row| Ok(parse_pending_upload_row(row)))?;
 
         let mut results = Vec::new();
         for row in rows {
             match row {
-                Ok(Ok(memory)) => results.push(memory),
+                Ok(Ok(upload)) => results.push(upload),
                 Ok(Err(e)) => tracing::warn!("failed to parse pending memory: {e}"),
                 Err(e) => tracing::warn!("failed to read row: {e}"),
             }
@@ -753,6 +753,24 @@ fn parse_memory_row(row: &rusqlite::Row) -> Result<CachedMemory, String> {
     })
 }
 
+fn parse_pending_upload_row(row: &rusqlite::Row) -> Result<PendingUpload, String> {
+    let memory = parse_memory_row(row)?;
+    let project_id = row
+        .get::<_, Option<String>>(11)
+        .map_err(|e| e.to_string())?
+        .and_then(|value| Uuid::parse_str(&value).ok());
+    let org_id = row
+        .get::<_, Option<String>>(12)
+        .map_err(|e| e.to_string())?
+        .and_then(|value| Uuid::parse_str(&value).ok());
+
+    Ok(PendingUpload {
+        memory,
+        project_id,
+        org_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,13 +806,19 @@ mod tests {
 
         let unsynced = test_memory("not synced", false);
         let synced = test_memory("already synced", true);
+        let project_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
 
-        cache.insert_memory(&unsynced).unwrap();
+        cache
+            .insert_memory_scoped(&unsynced, Some(project_id), Some(org_id))
+            .unwrap();
         cache.insert_memory(&synced).unwrap();
 
         let pending = cache.get_pending_uploads().unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, unsynced.id);
+        assert_eq!(pending[0].memory.id, unsynced.id);
+        assert_eq!(pending[0].project_id, Some(project_id));
+        assert_eq!(pending[0].org_id, Some(org_id));
     }
 
     #[test]

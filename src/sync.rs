@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::cache::LocalCache;
 use crate::client::{MemoryClient, PushMemoryRequest};
 use crate::error::SdkResult;
-use crate::models::{CachedMemory, SyncResult};
+use crate::models::{CachedMemory, PushSummary, SyncResult};
 
 pub struct SyncEngine {
     cache: LocalCache,
@@ -19,15 +19,14 @@ impl SyncEngine {
     }
 
     /// Push local-only memories to cloud, pull new cloud memories to local.
-    pub async fn sync(
-        &self,
-        user_id: Uuid,
-        project_id: Option<Uuid>,
-    ) -> SdkResult<SyncResult> {
+    pub async fn sync(&self, user_id: Uuid, project_id: Option<Uuid>) -> SdkResult<SyncResult> {
         let mut result = SyncResult::default();
 
         match self.push().await {
-            Ok(n) => result.pushed = n,
+            Ok(summary) => {
+                result.pushed = summary.pushed;
+                result.errors.extend(summary.errors);
+            }
             Err(e) => {
                 tracing::warn!("push failed (offline?): {e}");
                 result.errors.push(format!("push: {e}"));
@@ -46,47 +45,48 @@ impl SyncEngine {
     }
 
     /// Push pending local memories to cloud.
-    pub async fn push(&self) -> SdkResult<usize> {
+    pub async fn push(&self) -> SdkResult<PushSummary> {
         let pending = self.cache.get_pending_uploads()?;
-        let mut pushed = 0;
+        let mut summary = PushSummary::default();
 
-        for memory in &pending {
+        for upload in &pending {
+            let memory = &upload.memory;
             let req = PushMemoryRequest {
                 content: memory.content.clone(),
                 memory_type: memory.memory_type.clone(),
                 metadata: memory.metadata.clone(),
+                pin: Some(memory.pinned),
+                project_id: upload.project_id,
+                org_id: upload.org_id,
             };
 
             match self.client.push_memory(&req).await {
                 Ok(cloud_id) => {
                     self.cache.mark_synced(memory.id, cloud_id)?;
-                    pushed += 1;
+                    summary.pushed += 1;
                 }
                 Err(e) => {
                     tracing::warn!(memory_id = %memory.id, "failed to push memory: {e}");
-                    return Err(e);
+                    summary.errors.push(format!("push {}: {e}", memory.id));
                 }
             }
         }
 
-        Ok(pushed)
+        Ok(summary)
     }
 
     /// Pull new memories from cloud since last sync.
-    pub async fn pull(
-        &self,
-        user_id: Uuid,
-        project_id: Option<Uuid>,
-    ) -> SdkResult<usize> {
+    pub async fn pull(&self, _user_id: Uuid, project_id: Option<Uuid>) -> SdkResult<usize> {
         let since = self.cache.get_last_sync_timestamp()?;
 
-        let cloud_memories = self
-            .client
-            .pull_memories(user_id, project_id, since)
-            .await?;
+        let cloud_memories = self.client.pull_memories(project_id).await?;
 
         let mut pulled = 0;
         for cloud_mem in &cloud_memories {
+            if since.is_some_and(|timestamp| cloud_mem.created_at <= timestamp) {
+                continue;
+            }
+
             // Cloud memories don't include embeddings in the list endpoint.
             // Store with a zero vector; the local vector search won't match,
             // but the content is available for text-based lookups.
@@ -113,8 +113,7 @@ impl SyncEngine {
         }
 
         if pulled > 0 {
-            self.cache
-                .set_last_sync_timestamp(chrono::Utc::now())?;
+            self.cache.set_last_sync_timestamp(chrono::Utc::now())?;
         }
 
         Ok(pulled)
@@ -125,7 +124,7 @@ impl SyncEngine {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_memory(content: &str) -> CachedMemory {
@@ -144,37 +143,117 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn push_uploads_unsynced_memories() {
-        let server = MockServer::start().await;
-        let cloud_id = Uuid::new_v4();
+    fn mcp_tool_response(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{ "type": "text", "text": text }]
+            }
+        })
+    }
 
-        Mock::given(method("POST"))
-            .and(path("/api/memories"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "memory_id": cloud_id.to_string(),
+    fn remember_response(cloud_id: Uuid) -> serde_json::Value {
+        mcp_tool_response(
+            &serde_json::json!({
+                "memory_id": cloud_id,
                 "action_taken": "add",
                 "superseded_memory_id": null,
                 "reason": null,
                 "edges_created": 0,
                 "enrichments_triggered": 1
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn push_uploads_unsynced_memories() {
+        let server = MockServer::start().await;
+        let cloud_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": {
+                    "name": "remember",
+                    "arguments": {
+                        "content": "push me",
+                        "pin": true,
+                        "project_id": project_id,
+                        "org_id": org_id
+                    }
+                }
             })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remember_response(cloud_id)))
             .expect(1)
             .mount(&server)
             .await;
 
         let cache = LocalCache::open_in_memory().unwrap();
-        let mem = test_memory("push me");
-        cache.insert_memory(&mem).unwrap();
+        let mut mem = test_memory("push me");
+        mem.pinned = true;
+        cache
+            .insert_memory_scoped(&mem, Some(project_id), Some(org_id))
+            .unwrap();
 
         assert_eq!(cache.get_pending_uploads().unwrap().len(), 1);
 
         let client = MemoryClient::new(server.uri(), "key".to_string());
         let engine = SyncEngine::new(cache, client);
 
-        let pushed = engine.push().await.unwrap();
-        assert_eq!(pushed, 1);
+        let summary = engine.push().await.unwrap();
+        assert_eq!(summary.pushed, 1);
+        assert!(summary.errors.is_empty());
         assert_eq!(engine.cache.get_pending_uploads().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn push_continues_past_failing_record_and_reports_error() {
+        let server = MockServer::start().await;
+        let cloud_id = Uuid::new_v4();
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": { "arguments": { "content": "fail me" } }
+            })))
+            .respond_with(ResponseTemplate::new(500).set_body_string("record rejected"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": { "arguments": { "content": "push me" } }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remember_response(cloud_id)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache = LocalCache::open_in_memory().unwrap();
+        let failing = test_memory("fail me");
+        let succeeding = test_memory("push me");
+        cache.insert_memory(&failing).unwrap();
+        cache.insert_memory(&succeeding).unwrap();
+
+        let client = MemoryClient::new(server.uri(), "key".to_string());
+        let engine = SyncEngine::new(cache, client);
+
+        let summary = engine.push().await.unwrap();
+        assert_eq!(summary.pushed, 1);
+        assert_eq!(summary.errors.len(), 1);
+        assert!(summary.errors[0].contains(&failing.id.to_string()));
+        assert!(!summary.errors[0].contains("fail me"));
+
+        let pending = engine.cache.get_pending_uploads().unwrap();
+        assert!(pending.iter().any(|upload| upload.memory.id == failing.id));
+        assert!(!pending
+            .iter()
+            .any(|upload| upload.memory.id == succeeding.id));
     }
 
     #[tokio::test]
@@ -184,22 +263,29 @@ mod tests {
         let project_id = Uuid::new_v4();
         let org_id = Uuid::new_v4();
 
-        Mock::given(method("GET"))
-            .and(path("/api/memories"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "memories": [{
-                    "id": cloud_mem_id.to_string(),
-                    "content": "cloud memory",
-                    "memory_type": "semantic",
-                    "metadata": {},
-                    "project_id": project_id.to_string(),
-                    "org_id": org_id.to_string(),
-                    "relevance_score": 0.9,
-                    "is_pinned": false,
-                    "created_at": "2026-02-06T00:00:00Z",
-                    "updated_at": "2026-02-06T00:00:00Z"
-                }]
+        let list_response = serde_json::json!({
+            "memories": [{
+                "id": cloud_mem_id.to_string(),
+                "content": "cloud memory",
+                "memory_type": "semantic",
+                "metadata": {},
+                "project_id": project_id.to_string(),
+                "org_id": org_id.to_string(),
+                "relevance_score": 0.9,
+                "is_pinned": false,
+                "created_at": "2026-02-06T00:00:00Z",
+                "updated_at": "2026-02-06T00:00:00Z"
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": { "name": "list_memories" }
             })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mcp_tool_response(&list_response.to_string())),
+            )
             .expect(2)
             .mount(&server)
             .await;
@@ -236,25 +322,23 @@ mod tests {
 
         // Push response
         Mock::given(method("POST"))
-            .and(path("/api/memories"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "memory_id": cloud_id.to_string(),
-                "action_taken": "add",
-                "superseded_memory_id": null,
-                "reason": null,
-                "edges_created": 0,
-                "enrichments_triggered": 1
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": { "name": "remember" }
             })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remember_response(cloud_id)))
             .mount(&server)
             .await;
 
         // Pull response (empty — nothing new from cloud)
-        Mock::given(method("GET"))
-            .and(path("/api/memories"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "memories": [] })),
-            )
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": { "name": "list_memories" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mcp_tool_response(
+                &serde_json::json!({ "memories": [] }).to_string(),
+            )))
             .mount(&server)
             .await;
 
@@ -289,6 +373,8 @@ mod tests {
         assert_eq!(result.pushed, 0);
         assert_eq!(result.pulled, 0);
         assert_eq!(result.errors.len(), 2);
+        assert!(result.errors[0].starts_with(&format!("push {}:", mem.id)));
+        assert!(result.errors[1].starts_with("pull:"));
 
         // Memory should still be in cache, unsynced
         assert_eq!(engine.cache.count().unwrap(), 1);
@@ -299,20 +385,27 @@ mod tests {
     async fn pull_updates_last_sync_timestamp() {
         let server = MockServer::start().await;
 
-        Mock::given(method("GET"))
-            .and(path("/api/memories"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "memories": [{
-                    "id": Uuid::new_v4().to_string(),
-                    "content": "new cloud memory",
-                    "memory_type": "semantic",
-                    "metadata": {},
-                    "relevance_score": 1.0,
-                    "is_pinned": false,
-                    "created_at": "2026-02-06T00:00:00Z",
-                    "updated_at": "2026-02-06T00:00:00Z"
-                }]
+        let list_response = serde_json::json!({
+            "memories": [{
+                "id": Uuid::new_v4().to_string(),
+                "content": "new cloud memory",
+                "memory_type": "semantic",
+                "metadata": {},
+                "relevance_score": 1.0,
+                "is_pinned": false,
+                "created_at": "2026-02-06T00:00:00Z",
+                "updated_at": "2026-02-06T00:00:00Z"
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": { "name": "list_memories" }
             })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mcp_tool_response(&list_response.to_string())),
+            )
             .mount(&server)
             .await;
 
