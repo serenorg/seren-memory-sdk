@@ -17,6 +17,9 @@ pub enum SdkError {
     #[error("server returned {status}: {body}")]
     ServerError { status: u16, body: String },
 
+    #[error("MCP tool error: {0}")]
+    McpToolError(String),
+
     #[error("unauthorized")]
     Unauthorized,
 

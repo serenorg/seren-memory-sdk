@@ -122,27 +122,8 @@ impl MemoryClient {
             .send()
             .await?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SdkError::Unauthorized);
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SdkError::ServerError { status, body });
-        }
-
-        let rpc_response: serde_json::Value = resp.json().await?;
-
-        // Extract the text content from the MCP tools/call response.
-        // Format: { "result": { "content": [{ "type": "text", "text": "..." }] } }
-        let text = rpc_response["result"]["content"][0]["text"]
-            .as_str()
-            .ok_or_else(|| {
-                SdkError::Other("unexpected MCP response format".to_string())
-            })?;
-
-        let context: CloudSessionContext = serde_json::from_str(text)?;
+        let text = parse_mcp_tool_response(resp).await?;
+        let context: CloudSessionContext = serde_json::from_str(&text)?;
         Ok(context)
     }
 
@@ -245,40 +226,48 @@ impl MemoryClient {
             .send()
             .await?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(SdkError::Unauthorized);
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SdkError::ServerError { status, body });
-        }
-
-        // The MCP server may return SSE (text/event-stream) or plain JSON
-        // depending on the Accept header negotiation. Parse both formats.
-        let is_sse = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.contains("text/event-stream"))
-            .unwrap_or(false);
-
-        let body_text = resp.text().await?;
-
-        let json_str = if is_sse {
-            extract_sse_json(&body_text)?
-        } else {
-            body_text
-        };
-
-        let rpc_response: serde_json::Value = serde_json::from_str(&json_str)?;
-
-        rpc_response["result"]["content"][0]["text"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| SdkError::Other("unexpected MCP response format".to_string()))
+        parse_mcp_tool_response(resp).await
     }
+}
+
+/// Parse an MCP tools/call response and distinguish protocol-level tool
+/// failures from successful JSON-RPC transport responses.
+async fn parse_mcp_tool_response(resp: reqwest::Response) -> SdkResult<String> {
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(SdkError::Unauthorized);
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SdkError::ServerError { status, body });
+    }
+
+    // The MCP server may return SSE (text/event-stream) or plain JSON
+    // depending on the Accept header negotiation. Parse both formats.
+    let is_sse = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+    let body_text = resp.text().await?;
+    let json_str = if is_sse {
+        extract_sse_json(&body_text)?
+    } else {
+        body_text
+    };
+    let rpc_response: serde_json::Value = serde_json::from_str(&json_str)?;
+
+    let text = rpc_response["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| SdkError::Other("unexpected MCP response format".to_string()))?;
+
+    if rpc_response["result"]["isError"].as_bool() == Some(true) {
+        return Err(SdkError::McpToolError(text.to_string()));
+    }
+
+    Ok(text.to_string())
 }
 
 /// Extract JSON from an SSE response body.
@@ -481,6 +470,17 @@ mod tests {
         })
     }
 
+    fn mcp_tool_error_response(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{ "type": "text", "text": text }],
+                "isError": true
+            }
+        })
+    }
+
     #[tokio::test]
     async fn remember_calls_mcp_tool() {
         let server = MockServer::start().await;
@@ -520,6 +520,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SdkError::Unauthorized));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_errors_preserve_server_message_on_both_paths() {
+        let server = MockServer::start().await;
+        let message = "memory service dependency unavailable";
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mcp_tool_error_response(message)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = MemoryClient::new(server.uri(), "test-key".to_string());
+        let remember_error = client
+            .remember("test", "semantic", None, None)
+            .await
+            .unwrap_err();
+        let bootstrap_error = client
+            .session_bootstrap(&BootstrapInput {
+                project_id: None,
+                org_id: None,
+                token_budget: None,
+            })
+            .await
+            .unwrap_err();
+
+        for error in [remember_error, bootstrap_error] {
+            match error {
+                SdkError::McpToolError(actual) => assert_eq!(actual, message),
+                other => panic!("expected MCP tool error, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
