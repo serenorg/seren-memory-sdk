@@ -104,7 +104,11 @@ impl SyncEngine {
                 pinned: cloud_mem.is_pinned,
             };
 
-            self.cache.insert_memory(&cached)?;
+            self.cache.insert_memory_scoped(
+                &cached,
+                cloud_mem.project_id.or(project_id),
+                cloud_mem.org_id,
+            )?;
             pulled += 1;
         }
 
@@ -177,6 +181,8 @@ mod tests {
     async fn pull_downloads_cloud_memories() {
         let server = MockServer::start().await;
         let cloud_mem_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
 
         Mock::given(method("GET"))
             .and(path("/api/memories"))
@@ -186,6 +192,8 @@ mod tests {
                     "content": "cloud memory",
                     "memory_type": "semantic",
                     "metadata": {},
+                    "project_id": project_id.to_string(),
+                    "org_id": org_id.to_string(),
                     "relevance_score": 0.9,
                     "is_pinned": false,
                     "created_at": "2026-02-06T00:00:00Z",
@@ -201,11 +209,19 @@ mod tests {
         let engine = SyncEngine::new(cache, client);
 
         let user_id = Uuid::new_v4();
-        let pulled = engine.pull(user_id, None).await.unwrap();
+        let pulled = engine.pull(user_id, Some(project_id)).await.unwrap();
         assert_eq!(pulled, 1);
         assert_eq!(engine.cache.count().unwrap(), 1);
+        assert_eq!(
+            engine
+                .cache
+                .list_recent_scoped(Some(project_id), Some(org_id), 10)
+                .unwrap()
+                .len(),
+            1
+        );
 
-        engine.pull(user_id, None).await.unwrap();
+        engine.pull(user_id, Some(project_id)).await.unwrap();
         assert_eq!(
             engine.cache.count().unwrap(),
             1,

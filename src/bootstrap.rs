@@ -10,6 +10,8 @@ use crate::client::MemoryClient;
 use crate::error::SdkResult;
 use crate::models::{BootstrapInput, ContextSource, MemoryRef, SessionContext};
 
+const DEFAULT_TOKEN_BUDGET: usize = 2048;
+
 pub struct BootstrapOrchestrator {
     cache: LocalCache,
     client: MemoryClient,
@@ -46,14 +48,23 @@ impl BootstrapOrchestrator {
             }
             Err(e) => {
                 tracing::warn!("cloud bootstrap failed, using local cache: {e}");
-                self.bootstrap_from_cache(token_budget.unwrap_or(4000))
+                self.bootstrap_from_cache(
+                    project_id,
+                    org_id,
+                    token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET),
+                )
             }
         }
     }
 
     /// Build context from local cache only.
-    fn bootstrap_from_cache(&self, token_budget: usize) -> SdkResult<SessionContext> {
-        let memories = self.cache.list_recent(50)?;
+    fn bootstrap_from_cache(
+        &self,
+        project_id: Option<Uuid>,
+        org_id: Option<Uuid>,
+        token_budget: usize,
+    ) -> SdkResult<SessionContext> {
+        let memories = self.cache.list_recent_scoped(project_id, org_id, 50)?;
 
         let mut memories_by_type: HashMap<String, Vec<MemoryRef>> = HashMap::new();
         let mut total_tokens = 0;
@@ -226,6 +237,66 @@ mod tests {
         assert_eq!(ctx.source, ContextSource::LocalCache);
         assert_eq!(ctx.total_memories, 0);
         assert!(ctx.assembled_prompt.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cache_bootstrap_filters_by_project_and_org() {
+        let cache = LocalCache::open_in_memory().unwrap();
+        let target_project = Uuid::new_v4();
+        let target_org = Uuid::new_v4();
+
+        let insert = |content: &str, project_id: Option<Uuid>, org_id: Option<Uuid>| {
+            let mem = CachedMemory {
+                id: Uuid::new_v4(),
+                content: content.to_string(),
+                memory_type: "semantic".to_string(),
+                metadata: serde_json::json!({}),
+                embedding: vec![0.1; 1536],
+                relevance_score: 1.0,
+                created_at: Utc::now(),
+                synced: true,
+                cloud_id: Some(Uuid::new_v4()),
+                feedback_signal: None,
+                pinned: false,
+            };
+            cache
+                .insert_memory_scoped(&mem, project_id, org_id)
+                .unwrap();
+        };
+
+        insert("target memory", Some(target_project), Some(target_org));
+        insert("other project", Some(Uuid::new_v4()), Some(target_org));
+        insert("other org", Some(target_project), Some(Uuid::new_v4()));
+        insert("legacy unscoped", None, None);
+
+        let client = MemoryClient::new("http://localhost:1".to_string(), "key".to_string());
+        let orchestrator = BootstrapOrchestrator::new(cache, client);
+        let ctx = orchestrator
+            .bootstrap(Some(target_project), Some(target_org), None)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.source, ContextSource::LocalCache);
+        assert_eq!(ctx.total_memories, 1);
+        assert!(ctx.assembled_prompt.contains("target memory"));
+        assert!(!ctx.assembled_prompt.contains("other project"));
+        assert!(!ctx.assembled_prompt.contains("other org"));
+        assert!(!ctx.assembled_prompt.contains("legacy unscoped"));
+    }
+
+    #[tokio::test]
+    async fn cache_bootstrap_default_matches_desktop_token_reserve() {
+        let cache = LocalCache::open_in_memory().unwrap();
+        insert_test_memory(
+            &cache,
+            &"x".repeat((DEFAULT_TOKEN_BUDGET + 1) * 4),
+            "semantic",
+        );
+        let client = MemoryClient::new("http://localhost:1".to_string(), "key".to_string());
+        let orchestrator = BootstrapOrchestrator::new(cache, client);
+
+        let ctx = orchestrator.bootstrap(None, None, None).await.unwrap();
+        assert_eq!(ctx.total_memories, 0);
     }
 
     #[tokio::test]
