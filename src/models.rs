@@ -56,6 +56,21 @@ pub struct SyncResult {
     pub errors: Vec<String>,
 }
 
+/// Summary of a push attempt, including records that remain pending.
+#[derive(Debug, Clone, Default)]
+pub struct PushSummary {
+    pub pushed: usize,
+    pub errors: Vec<String>,
+}
+
+/// A pending local memory together with its cloud scope.
+#[derive(Debug, Clone)]
+pub struct PendingUpload {
+    pub memory: CachedMemory,
+    pub project_id: Option<Uuid>,
+    pub org_id: Option<Uuid>,
+}
+
 /// A memory returned from the cloud API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudMemory {
