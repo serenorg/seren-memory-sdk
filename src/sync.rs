@@ -192,7 +192,7 @@ mod tests {
                     "updated_at": "2026-02-06T00:00:00Z"
                 }]
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -204,6 +204,13 @@ mod tests {
         let pulled = engine.pull(user_id, None).await.unwrap();
         assert_eq!(pulled, 1);
         assert_eq!(engine.cache.count().unwrap(), 1);
+
+        engine.pull(user_id, None).await.unwrap();
+        assert_eq!(
+            engine.cache.count().unwrap(),
+            1,
+            "pulling the same cloud memory twice must be idempotent"
+        );
     }
 
     #[tokio::test]
