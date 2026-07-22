@@ -63,7 +63,9 @@ impl LocalCache {
                 synced BOOLEAN DEFAULT 0,
                 cloud_id TEXT,
                 feedback_signal INTEGER DEFAULT NULL,
-                pinned INTEGER NOT NULL DEFAULT 0
+                pinned INTEGER NOT NULL DEFAULT 0,
+                project_id TEXT,
+                org_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -98,6 +100,21 @@ impl LocalCache {
             "cached_memories",
             "pinned",
             "ALTER TABLE cached_memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.add_column_if_missing(
+            "cached_memories",
+            "project_id",
+            "ALTER TABLE cached_memories ADD COLUMN project_id TEXT",
+        )?;
+        self.add_column_if_missing(
+            "cached_memories",
+            "org_id",
+            "ALTER TABLE cached_memories ADD COLUMN org_id TEXT",
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cached_memories_scope
+             ON cached_memories(project_id, org_id, created_at DESC)",
+            [],
         )?;
 
         self.enforce_unique_cloud_ids()?;
@@ -231,15 +248,29 @@ impl LocalCache {
     /// (`cached_memories`, `vec_memories`, `fts_memories`) are updated
     /// atomically inside a single transaction.
     pub fn insert_memory(&self, memory: &CachedMemory) -> SdkResult<()> {
+        self.insert_memory_scoped(memory, None, None)
+    }
+
+    /// Insert a memory with the project and organization scope used by cloud
+    /// retrieval. Supplying a scope lets offline bootstrap fail closed instead
+    /// of mixing rows from other projects or organizations.
+    pub fn insert_memory_scoped(
+        &self,
+        memory: &CachedMemory,
+        project_id: Option<Uuid>,
+        org_id: Option<Uuid>,
+    ) -> SdkResult<()> {
         let embedding_bytes = f32_slice_to_bytes(&memory.embedding);
         let requested_id = memory.id.to_string();
         let cloud_id = memory.cloud_id.map(|id| id.to_string());
+        let project_id = project_id.map(|id| id.to_string());
+        let org_id = org_id.map(|id| id.to_string());
 
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
-            "INSERT INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id, feedback_signal, pinned)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id, feedback_signal, pinned, project_id, org_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT DO UPDATE SET
                  content = excluded.content,
                  memory_type = excluded.memory_type,
@@ -250,7 +281,9 @@ impl LocalCache {
                  synced = excluded.synced,
                  cloud_id = excluded.cloud_id,
                  feedback_signal = excluded.feedback_signal,
-                 pinned = excluded.pinned",
+                 pinned = excluded.pinned,
+                 project_id = COALESCE(excluded.project_id, cached_memories.project_id),
+                 org_id = COALESCE(excluded.org_id, cached_memories.org_id)",
             rusqlite::params![
                 requested_id,
                 memory.content,
@@ -263,6 +296,8 @@ impl LocalCache {
                 cloud_id,
                 memory.feedback_signal,
                 memory.pinned as i32,
+                project_id,
+                org_id,
             ],
         )?;
 
@@ -616,18 +651,36 @@ impl LocalCache {
 
     /// List recent memories ordered by creation time (newest first).
     pub fn list_recent(&self, limit: usize) -> SdkResult<Vec<CachedMemory>> {
+        self.list_recent_scoped(None, None, limit)
+    }
+
+    /// List recent memories within an optional project and organization scope.
+    /// When a scope is supplied, legacy rows without that scope are excluded.
+    pub fn list_recent_scoped(
+        &self,
+        project_id: Option<Uuid>,
+        org_id: Option<Uuid>,
+        limit: usize,
+    ) -> SdkResult<Vec<CachedMemory>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, content, memory_type, metadata, embedding,
                     relevance_score, created_at, synced, cloud_id,
                     feedback_signal, pinned
              FROM cached_memories
+             WHERE (?1 IS NULL OR project_id = ?1)
+               AND (?2 IS NULL OR org_id = ?2)
              ORDER BY created_at DESC
-             LIMIT ?1",
+             LIMIT ?3",
         )?;
 
-        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
-            Ok(parse_memory_row(row))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                project_id.map(|id| id.to_string()),
+                org_id.map(|id| id.to_string()),
+                limit as i64,
+            ],
+            |row| Ok(parse_memory_row(row)),
+        )?;
 
         let mut results = Vec::new();
         for row in rows {

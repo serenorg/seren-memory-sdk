@@ -63,6 +63,10 @@ pub struct CloudMemory {
     pub content: String,
     pub memory_type: String,
     pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub org_id: Option<Uuid>,
     pub relevance_score: f64,
     pub is_pinned: bool,
     pub created_at: DateTime<Utc>,
