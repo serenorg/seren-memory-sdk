@@ -100,7 +100,57 @@ impl LocalCache {
             "ALTER TABLE cached_memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         )?;
 
+        self.enforce_unique_cloud_ids()?;
         self.backfill_fts_if_needed()?;
+        Ok(())
+    }
+
+    /// Collapse legacy duplicate cloud rows and prevent them from returning.
+    /// The newest local copy is retained because it reflects the most recent
+    /// cloud pull. Secondary indexes are pruned in the same transaction.
+    fn enforce_unique_cloud_ids(&self) -> SdkResult<()> {
+        let index_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'index' AND name = 'idx_cached_memories_cloud_id'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if index_exists {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let duplicate_ids = "SELECT id
+             FROM cached_memories
+             WHERE cloud_id IS NOT NULL
+               AND rowid NOT IN (
+                   SELECT MAX(rowid)
+                   FROM cached_memories
+                   WHERE cloud_id IS NOT NULL
+                   GROUP BY cloud_id
+               )";
+        tx.execute(
+            &format!("DELETE FROM vec_memories WHERE id IN ({duplicate_ids})"),
+            [],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM fts_memories WHERE id IN ({duplicate_ids})"),
+            [],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM cached_memories WHERE id IN ({duplicate_ids})"),
+            [],
+        )?;
+
+        tx.execute(
+            "CREATE UNIQUE INDEX idx_cached_memories_cloud_id
+             ON cached_memories(cloud_id)
+             WHERE cloud_id IS NOT NULL",
+            [],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -182,15 +232,27 @@ impl LocalCache {
     /// atomically inside a single transaction.
     pub fn insert_memory(&self, memory: &CachedMemory) -> SdkResult<()> {
         let embedding_bytes = f32_slice_to_bytes(&memory.embedding);
-        let id_str = memory.id.to_string();
+        let requested_id = memory.id.to_string();
+        let cloud_id = memory.cloud_id.map(|id| id.to_string());
 
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
-            "INSERT OR REPLACE INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id, feedback_signal, pinned)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id, feedback_signal, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT DO UPDATE SET
+                 content = excluded.content,
+                 memory_type = excluded.memory_type,
+                 metadata = excluded.metadata,
+                 embedding = excluded.embedding,
+                 relevance_score = excluded.relevance_score,
+                 created_at = excluded.created_at,
+                 synced = excluded.synced,
+                 cloud_id = excluded.cloud_id,
+                 feedback_signal = excluded.feedback_signal,
+                 pinned = excluded.pinned",
             rusqlite::params![
-                id_str,
+                requested_id,
                 memory.content,
                 memory.memory_type,
                 serde_json::to_string(&memory.metadata).unwrap_or_default(),
@@ -198,11 +260,22 @@ impl LocalCache {
                 memory.relevance_score,
                 memory.created_at.to_rfc3339(),
                 memory.synced as i32,
-                memory.cloud_id.map(|id| id.to_string()),
+                cloud_id,
                 memory.feedback_signal,
                 memory.pinned as i32,
             ],
         )?;
+
+        // A cloud-id conflict updates the already-cached row without changing
+        // its local primary key. Use that canonical id for both search indexes.
+        let id_str = match &cloud_id {
+            Some(cloud_id) => tx.query_row(
+                "SELECT id FROM cached_memories WHERE cloud_id = ?1",
+                rusqlite::params![cloud_id],
+                |row| row.get(0),
+            )?,
+            None => requested_id,
+        };
 
         // vec0 and fts5 don't support INSERT OR REPLACE — delete first, then insert.
         tx.execute(
@@ -433,10 +506,39 @@ impl LocalCache {
 
     /// Mark a memory as synced to the cloud.
     pub fn mark_synced(&self, id: Uuid, cloud_id: Uuid) -> SdkResult<()> {
-        self.conn.execute(
-            "UPDATE cached_memories SET synced = 1, cloud_id = ?1 WHERE id = ?2",
-            rusqlite::params![cloud_id.to_string(), id.to_string()],
+        let id = id.to_string();
+        let cloud_id = cloud_id.to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        let existing_id: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM cached_memories WHERE cloud_id = ?1 AND id != ?2
+            )",
+            rusqlite::params![cloud_id, id],
+            |row| row.get(0),
         )?;
+
+        if existing_id {
+            // The server may deduplicate a push onto a cloud memory already in
+            // the cache. Drop the now-redundant pending local row atomically.
+            tx.execute(
+                "DELETE FROM vec_memories WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM fts_memories WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM cached_memories WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE cached_memories SET synced = 1, cloud_id = ?1 WHERE id = ?2",
+                rusqlite::params![cloud_id, id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -702,6 +804,84 @@ mod tests {
         cache.insert_memory(&mem).unwrap();
 
         assert_eq!(cache.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn cloud_id_migration_deduplicates_all_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicates.db");
+        let cache = LocalCache::open(&path).unwrap();
+        cache
+            .conn
+            .execute("DROP INDEX idx_cached_memories_cloud_id", [])
+            .unwrap();
+
+        let cloud_id = Uuid::new_v4();
+        let mut old = test_memory("old duplicate", true);
+        old.cloud_id = Some(cloud_id);
+        let mut current = test_memory("current duplicate", true);
+        current.cloud_id = Some(cloud_id);
+
+        cache.insert_memory(&old).unwrap();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id)
+                 VALUES (?1, ?2, ?3, '{}', ?4, 1.0, ?5, 1, ?6)",
+                rusqlite::params![
+                    current.id.to_string(),
+                    current.content,
+                    current.memory_type,
+                    f32_slice_to_bytes(&current.embedding),
+                    current.created_at.to_rfc3339(),
+                    cloud_id.to_string(),
+                ],
+            )
+            .unwrap();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO vec_memories (id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![
+                    current.id.to_string(),
+                    f32_slice_to_bytes(&current.embedding)
+                ],
+            )
+            .unwrap();
+        cache
+            .conn
+            .execute(
+                "INSERT INTO fts_memories (id, content, memory_type) VALUES (?1, ?2, ?3)",
+                rusqlite::params![current.id.to_string(), current.content, current.memory_type],
+            )
+            .unwrap();
+        assert_eq!(cache.count().unwrap(), 2);
+        drop(cache);
+
+        let cache = LocalCache::open(&path).unwrap();
+        let fts_count: usize = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_memories", [], |row| row.get(0))
+            .unwrap();
+        let vec_count: usize = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM vec_memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache.count().unwrap(), 1);
+        assert_eq!(fts_count, 1);
+        assert_eq!(vec_count, 1);
+
+        let duplicate_insert = cache.conn.execute(
+            "INSERT INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id)
+             VALUES (?1, 'blocked', 'semantic', '{}', ?2, 1.0, ?3, 1, ?4)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                f32_slice_to_bytes(&vec![0.0; 1536]),
+                Utc::now().to_rfc3339(),
+                cloud_id.to_string(),
+            ],
+        );
+        assert!(duplicate_insert.is_err());
     }
 
     #[test]
