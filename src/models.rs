@@ -63,12 +63,31 @@ pub struct PushSummary {
     pub errors: Vec<String>,
 }
 
+/// The cloud scope a memory belongs to. Grouping the three identifiers keeps
+/// callers from transposing them — they are all `Option<Uuid>` and positional
+/// arguments give the compiler no way to catch a swap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryScope {
+    pub project_id: Option<Uuid>,
+    pub org_id: Option<Uuid>,
+    pub session_id: Option<Uuid>,
+}
+
+impl MemoryScope {
+    pub fn new(project_id: Option<Uuid>, org_id: Option<Uuid>, session_id: Option<Uuid>) -> Self {
+        Self {
+            project_id,
+            org_id,
+            session_id,
+        }
+    }
+}
+
 /// A pending local memory together with its cloud scope.
 #[derive(Debug, Clone)]
 pub struct PendingUpload {
     pub memory: CachedMemory,
-    pub project_id: Option<Uuid>,
-    pub org_id: Option<Uuid>,
+    pub scope: MemoryScope,
 }
 
 /// A memory returned from the cloud API.
@@ -82,6 +101,8 @@ pub struct CloudMemory {
     pub project_id: Option<Uuid>,
     #[serde(default)]
     pub org_id: Option<Uuid>,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
     pub relevance_score: f64,
     pub is_pinned: bool,
     pub created_at: DateTime<Utc>,

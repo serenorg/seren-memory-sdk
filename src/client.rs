@@ -306,6 +306,8 @@ pub struct PushMemoryRequest {
     pub project_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
 }
 
 /// Response from pulling memories.
@@ -347,6 +349,7 @@ mod tests {
             pin: None,
             project_id: None,
             org_id: None,
+            session_id: None,
         };
 
         let result = client.push_memory(&req).await.unwrap();
@@ -371,6 +374,7 @@ mod tests {
             pin: None,
             project_id: None,
             org_id: None,
+            session_id: None,
         };
 
         let err = client.push_memory(&req).await.unwrap_err();
@@ -395,6 +399,7 @@ mod tests {
             pin: None,
             project_id: None,
             org_id: None,
+            session_id: None,
         };
 
         let err = client.push_memory(&req).await.unwrap_err();

@@ -6,7 +6,39 @@ use uuid::Uuid;
 use crate::cache::LocalCache;
 use crate::client::{MemoryClient, PushMemoryRequest};
 use crate::error::SdkResult;
-use crate::models::{CachedMemory, PushSummary, SyncResult};
+use crate::models::{CachedMemory, MemoryScope, PushSummary, SyncResult};
+
+/// Reserved metadata key holding the values a record carried when it was first
+/// captured locally.
+const ORIGIN_METADATA_KEY: &str = "seren_origin";
+
+/// The cloud `remember` tool accepts no capture time and no relevance score —
+/// it stamps its own. A record that waited in the pending queue would therefore
+/// reach the cloud dated to the moment it was pushed, losing when it was
+/// actually captured. Carry both values under a reserved metadata key so the
+/// origin survives the push and comes back on pull.
+fn metadata_with_origin(memory: &CachedMemory) -> serde_json::Value {
+    let origin = serde_json::json!({
+        "created_at": memory.created_at.to_rfc3339(),
+        "relevance_score": memory.relevance_score,
+    });
+
+    let mut fields = match &memory.metadata {
+        serde_json::Value::Object(fields) => fields.clone(),
+        serde_json::Value::Null => serde_json::Map::new(),
+        other => {
+            // Overwriting a non-object payload to attach the stamp would
+            // corrupt whatever the caller stored. Keep their metadata intact.
+            tracing::warn!(
+                memory_id = %memory.id,
+                "metadata is not an object; pushing it unchanged without an origin stamp"
+            );
+            return other.clone();
+        }
+    };
+    fields.insert(ORIGIN_METADATA_KEY.to_string(), origin);
+    serde_json::Value::Object(fields)
+}
 
 pub struct SyncEngine {
     cache: LocalCache,
@@ -54,10 +86,11 @@ impl SyncEngine {
             let req = PushMemoryRequest {
                 content: memory.content.clone(),
                 memory_type: memory.memory_type.clone(),
-                metadata: memory.metadata.clone(),
+                metadata: metadata_with_origin(memory),
                 pin: Some(memory.pinned),
-                project_id: upload.project_id,
-                org_id: upload.org_id,
+                project_id: upload.scope.project_id,
+                org_id: upload.scope.org_id,
+                session_id: upload.scope.session_id,
             };
 
             match self.client.push_memory(&req).await {
@@ -106,8 +139,11 @@ impl SyncEngine {
 
             self.cache.insert_memory_scoped(
                 &cached,
-                cloud_mem.project_id.or(project_id),
-                cloud_mem.org_id,
+                MemoryScope::new(
+                    cloud_mem.project_id.or(project_id),
+                    cloud_mem.org_id,
+                    cloud_mem.session_id,
+                ),
             )?;
             pulled += 1;
         }
@@ -196,7 +232,7 @@ mod tests {
         let mut mem = test_memory("push me");
         mem.pinned = true;
         cache
-            .insert_memory_scoped(&mem, Some(project_id), Some(org_id))
+            .insert_memory_scoped(&mem, MemoryScope::new(Some(project_id), Some(org_id), None))
             .unwrap();
 
         assert_eq!(cache.get_pending_uploads().unwrap().len(), 1);
@@ -208,6 +244,56 @@ mod tests {
         assert_eq!(summary.pushed, 1);
         assert!(summary.errors.is_empty());
         assert_eq!(engine.cache.get_pending_uploads().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn push_carries_session_scope_and_origin_stamp() {
+        let server = MockServer::start().await;
+        let cloud_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let captured_at = "2026-04-08T17:04:05+00:00"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+
+        // The cloud `remember` tool has no capture-time or relevance field, so
+        // both must arrive inside metadata alongside the caller's own keys.
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(serde_json::json!({
+                "params": {
+                    "name": "remember",
+                    "arguments": {
+                        "session_id": session_id,
+                        "metadata": {
+                            "topic": "release",
+                            "seren_origin": {
+                                "created_at": "2026-04-08T17:04:05+00:00",
+                                "relevance_score": 0.75
+                            }
+                        }
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remember_response(cloud_id)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache = LocalCache::open_in_memory().unwrap();
+        let mut mem = test_memory("queued during an outage");
+        mem.metadata = serde_json::json!({ "topic": "release" });
+        mem.relevance_score = 0.75;
+        mem.created_at = captured_at;
+        cache
+            .insert_memory_scoped(&mem, MemoryScope::new(None, None, Some(session_id)))
+            .unwrap();
+
+        let client = MemoryClient::new(server.uri(), "key".to_string());
+        let engine = SyncEngine::new(cache, client);
+
+        let summary = engine.push().await.unwrap();
+        assert_eq!(summary.pushed, 1);
+        assert!(summary.errors.is_empty());
     }
 
     #[tokio::test]

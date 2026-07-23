@@ -11,7 +11,7 @@ use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::error::SdkResult;
-use crate::models::{CachedMemory, FeedbackSignal, PendingUpload, RankedCachedMemory};
+use crate::models::{CachedMemory, FeedbackSignal, MemoryScope, PendingUpload, RankedCachedMemory};
 
 /// Reciprocal Rank Fusion constant — matches the cloud recall implementation.
 const RRF_K: f64 = 60.0;
@@ -65,7 +65,8 @@ impl LocalCache {
                 feedback_signal INTEGER DEFAULT NULL,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 project_id TEXT,
-                org_id TEXT
+                org_id TEXT,
+                session_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -110,6 +111,11 @@ impl LocalCache {
             "cached_memories",
             "org_id",
             "ALTER TABLE cached_memories ADD COLUMN org_id TEXT",
+        )?;
+        self.add_column_if_missing(
+            "cached_memories",
+            "session_id",
+            "ALTER TABLE cached_memories ADD COLUMN session_id TEXT",
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cached_memories_scope
@@ -248,29 +254,26 @@ impl LocalCache {
     /// (`cached_memories`, `vec_memories`, `fts_memories`) are updated
     /// atomically inside a single transaction.
     pub fn insert_memory(&self, memory: &CachedMemory) -> SdkResult<()> {
-        self.insert_memory_scoped(memory, None, None)
+        self.insert_memory_scoped(memory, MemoryScope::default())
     }
 
-    /// Insert a memory with the project and organization scope used by cloud
-    /// retrieval. Supplying a scope lets offline bootstrap fail closed instead
-    /// of mixing rows from other projects or organizations.
-    pub fn insert_memory_scoped(
-        &self,
-        memory: &CachedMemory,
-        project_id: Option<Uuid>,
-        org_id: Option<Uuid>,
-    ) -> SdkResult<()> {
+    /// Insert a memory with the project, organization, and session scope used by
+    /// cloud retrieval. Supplying a scope lets offline bootstrap fail closed
+    /// instead of mixing rows from other projects or organizations, and lets a
+    /// record queued during a cloud outage keep its scope until it is pushed.
+    pub fn insert_memory_scoped(&self, memory: &CachedMemory, scope: MemoryScope) -> SdkResult<()> {
         let embedding_bytes = f32_slice_to_bytes(&memory.embedding);
         let requested_id = memory.id.to_string();
         let cloud_id = memory.cloud_id.map(|id| id.to_string());
-        let project_id = project_id.map(|id| id.to_string());
-        let org_id = org_id.map(|id| id.to_string());
+        let project_id = scope.project_id.map(|id| id.to_string());
+        let org_id = scope.org_id.map(|id| id.to_string());
+        let session_id = scope.session_id.map(|id| id.to_string());
 
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
-            "INSERT INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id, feedback_signal, pinned, project_id, org_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "INSERT INTO cached_memories (id, content, memory_type, metadata, embedding, relevance_score, created_at, synced, cloud_id, feedback_signal, pinned, project_id, org_id, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT DO UPDATE SET
                  content = excluded.content,
                  memory_type = excluded.memory_type,
@@ -283,7 +286,8 @@ impl LocalCache {
                  feedback_signal = excluded.feedback_signal,
                  pinned = excluded.pinned,
                  project_id = COALESCE(excluded.project_id, cached_memories.project_id),
-                 org_id = COALESCE(excluded.org_id, cached_memories.org_id)",
+                 org_id = COALESCE(excluded.org_id, cached_memories.org_id),
+                 session_id = COALESCE(excluded.session_id, cached_memories.session_id)",
             rusqlite::params![
                 requested_id,
                 memory.content,
@@ -298,6 +302,7 @@ impl LocalCache {
                 memory.pinned as i32,
                 project_id,
                 org_id,
+                session_id,
             ],
         )?;
 
@@ -520,7 +525,7 @@ impl LocalCache {
         let mut stmt = self.conn.prepare(
             "SELECT id, content, memory_type, metadata, embedding,
                     relevance_score, created_at, synced, cloud_id,
-                    feedback_signal, pinned, project_id, org_id
+                    feedback_signal, pinned, project_id, org_id, session_id
              FROM cached_memories
              WHERE synced = 0",
         )?;
@@ -763,11 +768,14 @@ fn parse_pending_upload_row(row: &rusqlite::Row) -> Result<PendingUpload, String
         .get::<_, Option<String>>(12)
         .map_err(|e| e.to_string())?
         .and_then(|value| Uuid::parse_str(&value).ok());
+    let session_id = row
+        .get::<_, Option<String>>(13)
+        .map_err(|e| e.to_string())?
+        .and_then(|value| Uuid::parse_str(&value).ok());
 
     Ok(PendingUpload {
         memory,
-        project_id,
-        org_id,
+        scope: MemoryScope::new(project_id, org_id, session_id),
     })
 }
 
@@ -806,19 +814,22 @@ mod tests {
 
         let unsynced = test_memory("not synced", false);
         let synced = test_memory("already synced", true);
-        let project_id = Uuid::new_v4();
-        let org_id = Uuid::new_v4();
+        let scope = MemoryScope::new(
+            Some(Uuid::new_v4()),
+            Some(Uuid::new_v4()),
+            Some(Uuid::new_v4()),
+        );
 
-        cache
-            .insert_memory_scoped(&unsynced, Some(project_id), Some(org_id))
-            .unwrap();
+        cache.insert_memory_scoped(&unsynced, scope).unwrap();
         cache.insert_memory(&synced).unwrap();
 
         let pending = cache.get_pending_uploads().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].memory.id, unsynced.id);
-        assert_eq!(pending[0].project_id, Some(project_id));
-        assert_eq!(pending[0].org_id, Some(org_id));
+        assert_eq!(
+            pending[0].scope, scope,
+            "a queued record must keep the scope it was captured with"
+        );
     }
 
     #[test]
