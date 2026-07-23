@@ -148,7 +148,7 @@ fn format_prompt(memories_by_type: &HashMap<String, Vec<MemoryRef>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::CachedMemory;
+    use crate::models::{CachedMemory, MemoryScope};
     use chrono::Utc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -260,7 +260,7 @@ mod tests {
                 pinned: false,
             };
             cache
-                .insert_memory_scoped(&mem, project_id, org_id)
+                .insert_memory_scoped(&mem, MemoryScope::new(project_id, org_id, None))
                 .unwrap();
         };
 
