@@ -21,6 +21,9 @@ let cache = LocalCache::open("memory.db")?;
 cache.insert_memory(&memory)?;
 let results = cache.vector_search(&embedding, 10)?;
 
+// Exact-session cleanup removes primary, vector, and keyword-index rows.
+let deleted = cache.delete_by_session(conversation_id)?;
+
 // Cloud client
 let client = MemoryClient::new("https://memory.serendb.com".into(), api_key);
 client.remember("The deploy target is Cloudflare R2", "semantic", None, None).await?;
@@ -30,6 +33,12 @@ let results = client.recall("deploy target", None, Some(5)).await?;
 let engine = SyncEngine::new(cache, client);
 let result = engine.sync(user_id, project_id).await?;
 ```
+
+## Compatibility
+
+`LocalCache::delete_by_session` is available in crate version `0.1.1`.
+Git-based consumers such as Seren Desktop must update their lockfile to a
+`seren-memory-sdk` revision carrying that version before calling the API.
 
 ## Modules
 
