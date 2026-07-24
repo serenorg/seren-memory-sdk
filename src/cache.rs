@@ -122,6 +122,11 @@ impl LocalCache {
              ON cached_memories(project_id, org_id, created_at DESC)",
             [],
         )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cached_memories_session_id
+             ON cached_memories(session_id)",
+            [],
+        )?;
 
         self.enforce_unique_cloud_ids()?;
         self.backfill_fts_if_needed()?;
@@ -636,6 +641,36 @@ impl LocalCache {
         Ok(())
     }
 
+    /// Delete every locally cached memory associated with this session.
+    ///
+    /// Primary rows and both search indexes are cleaned up atomically. The
+    /// return value counts primary cached memories, so retrying a completed
+    /// deletion returns `0`.
+    pub fn delete_by_session(&self, session_id: Uuid) -> SdkResult<usize> {
+        let session_id = session_id.to_string();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM vec_memories
+             WHERE id IN (
+                 SELECT id FROM cached_memories WHERE session_id = ?1
+             )",
+            rusqlite::params![&session_id],
+        )?;
+        tx.execute(
+            "DELETE FROM fts_memories
+             WHERE id IN (
+                 SELECT id FROM cached_memories WHERE session_id = ?1
+             )",
+            rusqlite::params![&session_id],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM cached_memories WHERE session_id = ?1",
+            rusqlite::params![&session_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Persist a feedback signal on a memory. Silently no-ops on unknown ids.
     pub fn update_feedback(&self, id: Uuid, signal: FeedbackSignal) -> SdkResult<()> {
         self.conn.execute(
@@ -1141,6 +1176,80 @@ mod tests {
         );
     }
 
+    /// Session deletion is exercised against the same file-backed SQLite,
+    /// vec0, and FTS5 schema used in production. Exact-session matching must
+    /// remove both primary rows and search-index rows without widening to
+    /// another session or to unscoped rows.
+    #[test]
+    fn delete_by_session_removes_only_exact_session_from_all_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-delete.db");
+        let cache = LocalCache::open(&path).unwrap();
+        let target_session = Uuid::new_v4();
+        let other_session = Uuid::new_v4();
+
+        let mut target_a = test_memory("target alpha", false);
+        target_a.embedding = vec![1.0; 1536];
+        let mut target_b = test_memory("target beta", false);
+        target_b.embedding = vec![0.9; 1536];
+        let mut other = test_memory("other survivor", false);
+        other.embedding = vec![0.5; 1536];
+        let mut unscoped = test_memory("unscoped survivor", false);
+        unscoped.embedding = vec![0.0; 1536];
+
+        cache
+            .insert_memory_scoped(
+                &target_a,
+                MemoryScope::new(None, None, Some(target_session)),
+            )
+            .unwrap();
+        cache
+            .insert_memory_scoped(
+                &target_b,
+                MemoryScope::new(None, None, Some(target_session)),
+            )
+            .unwrap();
+        cache
+            .insert_memory_scoped(&other, MemoryScope::new(None, None, Some(other_session)))
+            .unwrap();
+        cache.insert_memory(&unscoped).unwrap();
+
+        assert_eq!(cache.keyword_search("target", 10).unwrap().len(), 2);
+        assert_eq!(cache.vector_search(&vec![1.0; 1536], 10).unwrap().len(), 4);
+
+        assert_eq!(cache.delete_by_session(target_session).unwrap(), 2);
+        assert_eq!(cache.count().unwrap(), 2);
+        assert!(cache.keyword_search("target", 10).unwrap().is_empty());
+
+        let vector_ids: Vec<Uuid> = cache
+            .vector_search(&vec![1.0; 1536], 10)
+            .unwrap()
+            .into_iter()
+            .map(|memory| memory.id)
+            .collect();
+        assert_eq!(vector_ids.len(), 2);
+        assert!(vector_ids.contains(&other.id));
+        assert!(vector_ids.contains(&unscoped.id));
+
+        let vec_count: usize = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM vec_memories", [], |row| row.get(0))
+            .unwrap();
+        let fts_count: usize = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM fts_memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(vec_count, 2);
+        assert_eq!(fts_count, 2);
+
+        assert_eq!(cache.delete_by_session(target_session).unwrap(), 0);
+        assert_eq!(
+            cache.keyword_search("survivor", 10).unwrap().len(),
+            2,
+            "other-session and NULL-session rows must remain searchable"
+        );
+    }
+
     /// `update_feedback` and `set_pinned` must persist via `list_recent`.
     /// One combined test keeps the persistence assertion crisp without
     /// duplicating the insert/read scaffold.
@@ -1198,10 +1307,13 @@ mod tests {
             .unwrap();
         drop(legacy);
 
-        // First open: migration adds feedback_signal + pinned.
+        // First open: migration adds all newer columns, including session_id.
         let cache = LocalCache::open(&path).unwrap();
         let mem = test_memory("legacy row", false);
-        cache.insert_memory(&mem).unwrap();
+        let session_id = Uuid::new_v4();
+        cache
+            .insert_memory_scoped(&mem, MemoryScope::new(None, None, Some(session_id)))
+            .unwrap();
         cache
             .update_feedback(mem.id, FeedbackSignal::Positive)
             .unwrap();
@@ -1213,5 +1325,6 @@ mod tests {
         let loaded = &cache.list_recent(10).unwrap()[0];
         assert_eq!(loaded.feedback_signal, Some(1));
         assert!(!loaded.pinned);
+        assert_eq!(cache.delete_by_session(session_id).unwrap(), 1);
     }
 }
