@@ -20,8 +20,15 @@ const RRF_K: f64 = 60.0;
 fn register_vec_extension() {
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut std::os::raw::c_char,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> std::os::raw::c_int,
+        >(
+            sqlite_vec::sqlite3_vec_init as *const ()
         )));
     });
 }
@@ -730,8 +737,10 @@ fn f32_slice_to_bytes(slice: &[f32]) -> Vec<u8> {
 
 fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
