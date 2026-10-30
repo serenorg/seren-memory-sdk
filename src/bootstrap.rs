@@ -127,9 +127,7 @@ fn format_prompt(memories_by_type: &HashMap<String, Vec<MemoryRef>>) -> String {
                 let mut c = w.chars();
                 match c.next() {
                     None => String::new(),
-                    Some(first) => {
-                        first.to_uppercase().to_string() + c.as_str()
-                    }
+                    Some(first) => first.to_uppercase().to_string() + c.as_str(),
                 }
             })
             .collect::<Vec<_>>()
@@ -373,7 +371,10 @@ mod tests {
         let ctx = orchestrator.bootstrap(None, None, None).await.unwrap();
         assert_eq!(ctx.source, ContextSource::LocalCache);
 
-        let refs = ctx.memories_by_type.get("convention").expect("type missing");
+        let refs = ctx
+            .memories_by_type
+            .get("convention")
+            .expect("type missing");
         assert_eq!(refs.len(), 1);
         assert_eq!(
             refs[0].id, cloud_id,

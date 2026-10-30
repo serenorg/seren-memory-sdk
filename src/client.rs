@@ -609,17 +609,22 @@ mod tests {
             .and(path("/mcp"))
             .and(header("authorization", "Bearer test-key"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(mcp_tool_response(&results.to_string())),
+                ResponseTemplate::new(200).set_body_json(mcp_tool_response(&results.to_string())),
             )
             .expect(1)
             .mount(&server)
             .await;
 
         let client = MemoryClient::new(server.uri(), "test-key".to_string());
-        let results = client.recall("what framework", None, Some(5)).await.unwrap();
+        let results = client
+            .recall("what framework", None, Some(5))
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, id_one, "recall must surface cloud memory ids");
+        assert_eq!(
+            results[0].id, id_one,
+            "recall must surface cloud memory ids"
+        );
         assert_eq!(results[0].content, "Axum 0.8 is used");
         assert_eq!(results[1].id, id_two);
         assert_eq!(results[1].memory_type, "convention");
@@ -650,16 +655,16 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/mcp"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(mcp_tool_response("ok")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(mcp_tool_response("ok")))
             .expect(1)
             .mount(&server)
             .await;
 
         let client = MemoryClient::new(server.uri(), "test-key".to_string());
-        let result = client.remember("fact", "semantic", None, None).await.unwrap();
+        let result = client
+            .remember("fact", "semantic", None, None)
+            .await
+            .unwrap();
         assert_eq!(result, "ok");
     }
 

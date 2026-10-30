@@ -182,18 +182,11 @@ impl LocalCache {
         Ok(())
     }
 
-    fn add_column_if_missing(
-        &self,
-        table: &str,
-        column: &str,
-        ddl: &str,
-    ) -> SdkResult<()> {
+    fn add_column_if_missing(&self, table: &str, column: &str, ddl: &str) -> SdkResult<()> {
         // PRAGMA table_info doesn't accept bindings for the table name —
         // this is internal-only and the values are static identifiers, so
         // string interpolation is safe.
-        let mut stmt = self
-            .conn
-            .prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let name: String = row.get(1)?;
@@ -225,9 +218,7 @@ impl LocalCache {
         let tx = self.conn.unchecked_transaction()?;
 
         let rows: Vec<(String, String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, content, memory_type FROM cached_memories",
-            )?;
+            let mut stmt = tx.prepare("SELECT id, content, memory_type FROM cached_memories")?;
             let mapped = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -346,7 +337,11 @@ impl LocalCache {
     }
 
     /// Search for similar memories using vector similarity.
-    pub fn vector_search(&self, query_embedding: &[f32], limit: usize) -> SdkResult<Vec<CachedMemory>> {
+    pub fn vector_search(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> SdkResult<Vec<CachedMemory>> {
         Ok(self
             .vector_search_scored(query_embedding, limit)?
             .into_iter()
@@ -397,11 +392,7 @@ impl LocalCache {
     ///
     /// `query` is passed straight to FTS5; callers that accept untrusted
     /// input should sanitize/quote tokens to avoid FTS5 query-syntax errors.
-    pub fn keyword_search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> SdkResult<Vec<(CachedMemory, f64)>> {
+    pub fn keyword_search(&self, query: &str, limit: usize) -> SdkResult<Vec<(CachedMemory, f64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT cm.id, cm.content, cm.memory_type, cm.metadata, cm.embedding,
                     cm.relevance_score, cm.created_at, cm.synced, cm.cloud_id,
@@ -593,9 +584,7 @@ impl LocalCache {
             .conn
             .prepare("SELECT value FROM sync_state WHERE key = 'last_sync'")?;
 
-        let result: Option<String> = stmt
-            .query_row([], |row| row.get(0))
-            .ok();
+        let result: Option<String> = stmt.query_row([], |row| row.get(0)).ok();
 
         match result {
             Some(ts) => Ok(ts.parse::<DateTime<Utc>>().ok()),
@@ -614,9 +603,9 @@ impl LocalCache {
 
     /// Count all cached memories.
     pub fn count(&self) -> SdkResult<usize> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM cached_memories", [], |row| row.get(0))?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM cached_memories", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
